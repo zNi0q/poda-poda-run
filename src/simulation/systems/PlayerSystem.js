@@ -21,11 +21,21 @@
       run.dwell -= dt;
       dwellFinished = run.dwell <= 0;
     }
+    // Backing up to a stop the player overshot: braking rolls the poda backwards
+    // instead of stopping dead, down to a slow walking reverse.
+    else if (braking && run.reversing) run.speed = Math.max(-(run.reverseSpeed || 3), run.speed - vehicle.braking * dt);
     else if (braking) run.speed = Math.max(0, run.speed - vehicle.braking * dt);
+    else if (run.speed < 0) run.speed = Math.min(0, run.speed + vehicle.braking * dt);
     else run.speed += clamp(target - run.speed, -3 * dt, vehicle.acceleration * (gas ? 1.8 : 1) * dt);
+    // A road with real corners (the CBD) sets run.speedCap: the vehicle eases down
+    // to it on its own brakes so a bend can never be entered too fast. No cap, no change.
+    if (run.speedCap != null && run.speed > run.speedCap && !(run.dwell > 0)) {
+      run.speed = Math.max(run.speedCap, run.speed - vehicle.braking * dt);
+    }
 
     const distance = run.speed * dt;
-    run.dist += distance;
+    // Odometer only ever counts forward, so reversing cannot farm distance score.
+    run.dist += Math.max(0, distance);
     run.toStop -= distance;
     run.invuln = Math.max(0, run.invuln - dt);
     run.magnet = Math.max(0, run.magnet - dt);

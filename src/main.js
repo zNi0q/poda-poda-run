@@ -1,12 +1,22 @@
+import { createStreakUI } from './ui/StreakUI.js';
 import '../base-ui.css';
 import '../drive-ui.css';
-import publicDomain from '../CNAME?raw';
+import '../start-ui.css';
+import '../run-ui.css';
+import '../account-ui.css';
+import { createAccountUI } from './ui/AccountUI.js';
+import { modal } from './ui/Modal.js';
 import './simulation/systems/RoadContactSystem.js';
 import { registerEasternDistricts } from './data/EasternDistricts.js';
+import { createGuestProfile, normalizeNickname } from './services/GuestProfile.mjs';
 import { createScorePoster } from './ui/ScorePoster.js';
 import './simulation/systems/TrafficAI.js';
+import './simulation/systems/SendMeController.js';
+import { createSendMeFactory, animateSendMe } from './assets/vehicles/sendmeRider.js';
 import './data/GameConfig.js';
 import './simulation/systems/JumpSystem.js';
+import * as THREE from 'three';
+import { createFreetownAerial } from './world/FreetownAerial.js';
 import { createWorkshop } from './assets/props/workshop.js';
 import { createRoleDecorator } from './assets/people/roles.js';
 import { createBuildingFactory } from './assets/buildings/buildingFactory.js';
@@ -14,6 +24,10 @@ import { createLumleyDetails } from './assets/props/lumley.js';
 import { createFreightFactory } from './assets/vehicles/freight.js';
 import { TrafficPool } from './assets/vehicles/trafficPool.js';
 import { createStreetAssets } from './assets/roads/streetAssets.js';
+import { createCbdMode } from './cbd/CbdMode.js';
+import { EnvironmentManager } from './rendering/EnvironmentManager.js';
+import { attachVehicleLights, NPC_BEAM_DISTANCE } from './rendering/VehicleLights.js';
+import { createStreetLights } from './rendering/StreetLights.js';
 import '../vehicles.js';
 import '../districts-west.js';
 import '../districts-east.js';
@@ -36,8 +50,7 @@ import './services/ApiClient.js';
 
 (() => {
 'use strict';
-const THREE = window.THREE;
-const gameURL = 'https://' + publicDomain.trim() + '/';
+const gameURL = 'https://podapodarun.com/';
 
 /* ================================================================
    Local flavour — everything Freetown lives here
@@ -45,7 +58,7 @@ const gameURL = 'https://' + publicDomain.trim() + '/';
 const DATA = {
   // Lumley → Waterloo, the east–west corridor the official fare tables use
   route: window.PODA_RUN_RULES.ROUTE,
-  fare: 6,                        // new Leones per hop (2026 fare table: Lumley–Regent Rd NLe 6.1)
+  fare: window.PODA_RUN_RULES.FARE,                        // new Leones per hop (2026 fare table: Lumley–Regent Rd NLe 6.1)
   // real slogans seen painted on Freetown poda-podas
   slogans: ['GOD IS GREAT', 'DONE DEM ALL', 'NEVER DISCOURAGE', 'RESPECT THY NEIGHBOUR', 'FEAR JUDGMENT DAY', 'GOD WILL PROVIDE', "GOD'S GIFT", 'TRUST IN ALLAH', 'GOD SAVE THE TRAVELERS', 'DE GUNNERS'],
   // transport-company names painted along poda-poda sides
@@ -57,6 +70,7 @@ const DATA = {
     drop:   [['Wan bel na ya!', 'Stop here!'], ['Drop mi ya.', 'Drop me here.'], ['Gi mi mi chenj!', 'Give me my change!']],
     miss:   [['Lef! Lef! Driver, lef!', 'Stop! Stop! Driver, stop!'], ['Eh bo! Wan bel na ya!', 'Ah, man! I said stop here!']],
     stumble:[['Tek tem!', 'Careful!'], ['Eh bo!', 'Ah, man!'], ['A de kam dong!', "I'm getting off!"], ['Wahala!', 'Trouble!']],
+    reverse:[['Driver, yu don pas am!', "Driver, you've gone past it!"], ['Bak small! Bak small!', 'Back up a little!']],
     horn:   [['Komot na rod!', 'Out of the way!']],
     perfect:[['A tel God tenki!', 'Thank God!']],
   },
@@ -77,10 +91,18 @@ const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const shuffle = a => { for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; };
 const fmtLe = n => 'Le ' + Math.round(n).toLocaleString('en-US');
 const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+// The mapped downtown block is the Central route. Keep ?cbd as an old deep link.
+const CBD_FLAG = new URLSearchParams(location.search).has('cbd');
+let cbd = null;
+let centralMode = null;
 const store = {
   get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
   set(k, v) { try { localStorage.setItem(k, v); return true; } catch (e) { return false; } },
+  remove(k) { try { localStorage.removeItem(k); } catch {} },
+  keys() { try { return Object.keys(localStorage); } catch { return []; } },
 };
+
+const guestProfile = createGuestProfile(store);
 
 /* ================================================================
    Three.js setup
@@ -129,6 +151,8 @@ sun.shadow.bias = -0.0008;
 scene.add(sun, sun.target);
 const cameraSystem = new window.PODA_CameraSystem(camera, sun, rand);
 const qualityManager = new window.PODA_QualityManager(renderer, sun, scene, resize, devicePixelRatio);
+const environment = new EnvironmentManager({ renderer, scene, hemi, sun, quality: qualityManager });
+let streetLighting = null;
 
 /* shared geometry + material cache */
 const G = {
@@ -166,56 +190,200 @@ const ROOF = [0x8f9396, 0x9a5a3a, 0xa7abad, 0x7f4a32, 0x6e7276];
 let roadTex, roadDetailTex, walkTex, coinMat, shopTex = [], sloganTex = {};
 const LANE_W = 3.4, LANES = [-LANE_W, 0, LANE_W], ROAD_HALF = LANE_W * 1.5 + 0.35;
 
+/* ---------- Tileable value noise ----------
+   Asphalt reads wrong when its only variation is per-pixel speckle: real road
+   surface drifts in tone over metres, from paving batches, patching and wear.
+   This is a coarse random lattice sampled bilinearly and summed over octaves,
+   wrapped so the result still tiles. Returns 0..1 per texel. */
+function noiseField(size, cells, octaves = 4) {
+  const out = new Float32Array(size * size);
+  let amplitude = 1, total = 0;
+  for (let o = 0; o < octaves; o++) {
+    const n = cells << o;
+    const lattice = new Float32Array(n * n);
+    for (let i = 0; i < lattice.length; i++) lattice[i] = Math.random();
+    const scale = n / size;
+    for (let y = 0; y < size; y++) {
+      const fy = y * scale, y0 = Math.floor(fy), ty = fy - y0;
+      const r0 = (y0 % n) * n, r1 = ((y0 + 1) % n) * n;
+      for (let x = 0; x < size; x++) {
+        const fx = x * scale, x0 = Math.floor(fx), tx = fx - x0;
+        const c0 = x0 % n, c1 = (x0 + 1) % n;
+        const top = lattice[r0 + c0] * (1 - tx) + lattice[r0 + c1] * tx;
+        const bot = lattice[r1 + c0] * (1 - tx) + lattice[r1 + c1] * tx;
+        out[y * size + x] += (top * (1 - ty) + bot * ty) * amplitude;
+      }
+    }
+    total += amplitude;
+    amplitude *= 0.5;
+  }
+  for (let i = 0; i < out.length; i++) out[i] /= total;
+  return out;
+}
+
+/* Lane centres and wheel tracks in texture U, derived from the real road metrics
+   so the worn ribbons line up with where vehicles actually drive. */
+const ROAD_U = x => (x + ROAD_HALF) / (ROAD_HALF * 2);
+const WHEEL_TRACKS = LANES.flatMap(x => [ROAD_U(x - 0.85), ROAD_U(x + 0.85)]);
+
 function buildTextures() {
-  roadTex = canvasTex(512, 512, (g, w, h) => {
-    g.fillStyle = '#53534f'; g.fillRect(0, 0, w, h);
-    // Broad wear, fine aggregate, repair patches and sparse cracks live in one repeating map.
-    for (let i = 0; i < 95; i++) {
-      const v = randi(43, 81), x = rand(0, w), y = rand(0, h), r = rand(11, 62);
-      const wash = g.createRadialGradient(x, y, 1, x, y, r);
-      wash.addColorStop(0, `rgba(${v},${v - 2},${v - 4},.19)`);
-      wash.addColorStop(1, `rgba(${v},${v - 2},${v - 4},0)`);
-      g.fillStyle = wash; g.fillRect(x - r, y - r, r * 2, r * 2);
+  const RS = 1024;                       // road maps: ~94 px per metre across
+  roadTex = canvasTex(RS, RS, (g, w, h) => {
+    // 1. Base course, darker than before so the bus, markings and hazards carry
+    //    the brightness instead of competing with the road.
+    g.fillStyle = '#434240'; g.fillRect(0, 0, w, h);
+
+    // 2. Large-scale tonal drift plus fine aggregate, written per texel. Two
+    //    noise octaves at different lattice sizes give batch-level blotching
+    //    and stone-level grain in one pass.
+    const broad = noiseField(w, 4, 4), grain = noiseField(w, 64, 2);
+    const img = g.getImageData(0, 0, w, h), px = img.data;
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const i = y * w + x, p = i * 4;
+        const u = x / w;
+        // Grain carries most of the variation, but kept restrained: asphalt at
+        // speed should read as a settled surface, not a busy one.
+        let v = (broad[i] - 0.5) * 9 + (grain[i] - 0.5) * 24;
+        v += (Math.random() - 0.5) * 10;                       // per-texel sparkle
+        // Wheel ribbons: polished darker bands where tyres actually track.
+        for (const track of WHEEL_TRACKS) {
+          const d = Math.abs(u - track);
+          if (d < 0.055) v -= (1 - d / 0.055) * 15;
+        }
+        // Laterite dust drifting in from the shoulders — a Freetown road reads
+        // red-brown at the edges, not grey.
+        const edge = Math.max(0, 1 - Math.min(u, 1 - u) / 0.1);
+        px[p] = clamp(px[p] + v + edge * 34, 0, 255);
+        px[p + 1] = clamp(px[p + 1] + v + edge * 20, 0, 255);
+        px[p + 2] = clamp(px[p + 2] + v + edge * 8, 0, 255);
+      }
     }
-    for (let i = 0; i < 13500; i++) {
-      const v = randi(65, 122);
-      g.fillStyle = `rgba(${v},${v - 2},${v - 4},${rand(.12, .37)})`;
-      g.fillRect(rand(0, w), rand(0, h), rand(.6, 2.3), rand(.6, 2.3));
+    g.putImageData(img, 0, 0);
+
+    // 3. Coarser exposed stones, drawn as lit/shadowed pairs so the bump map
+    //    has something with a direction to it.
+    for (let i = 0; i < 1100; i++) {
+      const x = rand(0, w), y = rand(0, h), r = rand(1, 2.9), t = randi(92, 136);
+      g.fillStyle = `rgba(${t},${t - 3},${t - 7},${rand(.09, .22)})`;
+      g.beginPath(); g.ellipse(x, y, r, r * 0.8, rand(0, 3), 0, 7); g.fill();
+      g.fillStyle = 'rgba(18,18,17,.16)';
+      g.beginPath(); g.ellipse(x + r * .5, y + r * .5, r * .7, r * .55, 0, 0, 7); g.fill();
     }
-    for (let i = 0; i < 3; i++) {
-      const x = rand(36, w - 115), y = rand(10, h - 65), pw = rand(35, 90), ph = rand(23, 65);
-      g.beginPath();
-      g.moveTo(x + rand(-4, 4), y); g.lineTo(x + pw + rand(-4, 4), y + rand(-3, 3));
-      g.lineTo(x + pw + rand(-4, 4), y + ph); g.lineTo(x + rand(-4, 4), y + ph + rand(-3, 3)); g.closePath();
-      g.fillStyle = `rgba(${randi(55, 70)},${randi(55, 70)},${randi(52, 66)},.3)`; g.fill();
-      g.strokeStyle = 'rgba(27,28,27,.18)'; g.lineWidth = 1.2; g.stroke();
+
+    // 4. Oil and diesel drip down the middle of each lane, heaviest where
+    //    traffic crawls. Narrow, dark and slightly blue-black.
+    //    Kept sparse and faint: overlapping ellipses accumulate fast, and at any
+    //    density above this they merge into wet-looking slicks.
+    for (const lane of LANES) {
+      const cx = ROAD_U(lane) * w;
+      for (let i = 0; i < 30; i++) {
+        const y = rand(0, h), len = rand(6, 26), wid = rand(1, 3.4);
+        g.fillStyle = `rgba(24,24,28,${rand(.03, .075)})`;
+        g.beginPath(); g.ellipse(cx + rand(-7, 7), y, wid, len, 0, 0, 7); g.fill();
+      }
     }
-    for (let i = 0; i < 13; i++) {
-      let x = rand(20, w - 20), y = rand(0, h);
+
+    // 5. Repair patches: a different mix, a dark cut seam and their own grain.
+    for (let i = 0; i < 7; i++) {
+      const x = rand(20, w - 190), y = rand(0, h), pw = rand(70, 180), ph = rand(45, 150);
+      g.save(); g.beginPath();
+      g.moveTo(x + rand(-7, 7), y); g.lineTo(x + pw + rand(-7, 7), y + rand(-6, 6));
+      g.lineTo(x + pw + rand(-7, 7), y + ph); g.lineTo(x + rand(-7, 7), y + ph + rand(-6, 6));
+      g.closePath(); g.clip();
+      const tone = randi(54, 80);
+      g.fillStyle = `rgba(${tone},${tone - 1},${tone - 4},.38)`; g.fillRect(x - 10, y - 10, pw + 20, ph + 20);
+      for (let s = 0; s < 420; s++) {
+        const t = randi(70, 140);
+        g.fillStyle = `rgba(${t},${t},${t - 4},${rand(.1, .3)})`;
+        g.fillRect(rand(x, x + pw), rand(y, y + ph), rand(.8, 2.6), rand(.8, 2.6));
+      }
+      g.restore();
+      g.strokeStyle = 'rgba(16,16,15,.5)'; g.lineWidth = rand(1.5, 3); g.stroke();
+    }
+
+    // 6. Cracks that branch, and the tar someone brushed over the worst of them.
+    const crack = (x, y, depth, width) => {
       g.beginPath(); g.moveTo(x, y);
-      for (let j = 0; j < 5; j++) { x += rand(-11, 11); y += rand(5, 19); g.lineTo(x, y); }
-      g.strokeStyle = 'rgba(22,23,23,.28)'; g.lineWidth = rand(.7, 1.8); g.stroke();
+      let cx = x, cy = y;
+      for (let j = 0; j < 6; j++) { cx += rand(-14, 14); cy += rand(8, 26); g.lineTo(cx, cy); }
+      g.strokeStyle = `rgba(20,20,19,${rand(.14, .3)})`; g.lineWidth = width; g.stroke();
+      if (depth > 0 && Math.random() < 0.5) crack(cx, cy, depth - 1, width * 0.65);
+    };
+    for (let i = 0; i < 9; i++) crack(rand(0, w), rand(0, h), 1, rand(.9, 1.9));
+    for (let i = 0; i < 3; i++) {                              // tar-sealed repairs
+      let x = rand(0, w), y = rand(0, h);
+      g.beginPath(); g.moveTo(x, y);
+      for (let j = 0; j < 5; j++) { x += rand(-20, 20); y += rand(14, 34); g.lineTo(x, y); }
+      g.strokeStyle = 'rgba(26,25,24,.62)'; g.lineWidth = rand(3.5, 7);
+      g.lineCap = 'round'; g.stroke(); g.lineCap = 'butt';
     }
-    const edge = g.createLinearGradient(0, 0, w, 0);
-    edge.addColorStop(0, '#756c5c'); edge.addColorStop(.045, '#5d5b54'); edge.addColorStop(.14, '#0000');
-    edge.addColorStop(.86, '#0000'); edge.addColorStop(.955, '#5d5b54'); edge.addColorStop(1, '#756c5c');
-    g.fillStyle = edge; g.fillRect(0, 0, w, h);
-    g.fillStyle = 'rgba(224,214,179,.72)';
-    for (const x of [w / 3, 2 * w / 3]) g.fillRect(x - 2, 15, 4, h * .42);
-    g.fillStyle = 'rgba(231,195,82,.73)'; g.fillRect(7, 0, 4, h); g.fillRect(w - 11, 0, 4, h);
+
+    // 7. Markings, worn. Real lane paint is chipped and thinned by the tyres
+    //    that cross it, so each dash is drawn in broken segments.
+    const paint = (x, y, len, width, colour) => {
+      for (let s = 0; s < len; s += rand(3, 9)) {
+        if (Math.random() < 0.22) continue;                    // scuffed away
+        const seg = Math.min(rand(5, 16), len - s);
+        g.fillStyle = colour.replace('ALPHA', rand(.4, .82).toFixed(2));
+        g.fillRect(x + rand(-.6, .6), y + s, width, seg);
+      }
+    };
+    for (const x of [w / 3, 2 * w / 3]) {
+      for (let y = 20; y < h; y += h * 0.5) paint(x - 3, y, h * 0.34, 6, 'rgba(226,218,190,ALPHA)');
+    }
+    paint(13, 0, h, 7, 'rgba(222,186,76,ALPHA)');
+    paint(w - 20, 0, h, 7, 'rgba(222,186,76,ALPHA)');
+
+    // 8. Ravelled edge where the asphalt crumbles into the shoulder.
+    for (let i = 0; i < 420; i++) {
+      const side = Math.random() < 0.5 ? rand(0, 26) : rand(w - 26, w);
+      const t = randi(70, 115);
+      g.fillStyle = `rgba(${t + 14},${t + 4},${t - 10},${rand(.12, .3)})`;
+      g.fillRect(side, rand(0, h), rand(1, 3), rand(1, 3));
+    }
   });
   roadTex.wrapS = roadTex.wrapT = THREE.RepeatWrapping; roadTex.repeat.set(1, 10);
   // Non-colour data for aggregate relief and dry/worn roughness.
-  roadDetailTex = canvasTex(512, 512, (g, w, h) => {
-    g.fillStyle = '#d6d6d6'; g.fillRect(0, 0, w, h);
-    for (let i = 0; i < 21000; i++) {
-      const v = randi(115, 245);
-      g.fillStyle = `rgb(${v},${v},${v})`;
-      g.fillRect(rand(0, w), rand(0, h), rand(.6, 2.4), rand(.6, 2.4));
+  roadDetailTex = canvasTex(RS, RS, (g, w, h) => {
+    // Serves as both bumpMap and roughnessMap, so brightness means "raised and
+    // coarse" and darkness means "worn smooth and slightly shiny". That pairing
+    // is physically consistent: the stone tops catch light, the polished wheel
+    // ribbons stay darker and reflect more.
+    g.fillStyle = '#b8b8b8'; g.fillRect(0, 0, w, h);
+    const grain = noiseField(w, 64, 2), broad = noiseField(w, 8, 3);
+    const img = g.getImageData(0, 0, w, h), px = img.data;
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const i = y * w + x, p = i * 4, u = x / w;
+        let v = (grain[i] - 0.5) * 48 + (broad[i] - 0.5) * 18 + (Math.random() - 0.5) * 24;
+        for (const track of WHEEL_TRACKS) {
+          const d = Math.abs(u - track);
+          if (d < 0.055) v -= (1 - d / 0.055) * 40;            // polished smooth
+        }
+        const t = clamp(px[p] + v, 0, 255);
+        px[p] = px[p + 1] = px[p + 2] = t;
+      }
     }
-    for (let i = 0; i < 13; i++) {
-      g.fillStyle = 'rgba(67,67,67,.25)';
-      g.fillRect(rand(35, w - 110), rand(0, h), rand(35, 95), rand(25, 75));
+    g.putImageData(img, 0, 0);
+    // Proud stones, matching the colour map's coarse aggregate.
+    for (let i = 0; i < 1100; i++) {
+      const x = rand(0, w), y = rand(0, h), r = rand(1, 2.9);
+      g.fillStyle = `rgba(255,255,255,${rand(.14, .32)})`;
+      g.beginPath(); g.ellipse(x, y, r, r * 0.8, rand(0, 3), 0, 7); g.fill();
+      g.fillStyle = 'rgba(0,0,0,.2)';
+      g.beginPath(); g.ellipse(x + r * .6, y + r * .6, r * .6, r * .5, 0, 0, 7); g.fill();
+    }
+    // Patches sit a little proud of the surface; cracks cut into it.
+    for (let i = 0; i < 7; i++) {
+      g.fillStyle = `rgba(${randi(150, 195)},${randi(150, 195)},${randi(150, 195)},.4)`;
+      g.fillRect(rand(20, w - 190), rand(0, h), rand(70, 180), rand(45, 150));
+    }
+    for (let i = 0; i < 16; i++) {
+      let x = rand(0, w), y = rand(0, h);
+      g.beginPath(); g.moveTo(x, y);
+      for (let j = 0; j < 6; j++) { x += rand(-14, 14); y += rand(8, 26); g.lineTo(x, y); }
+      g.strokeStyle = 'rgba(0,0,0,.6)'; g.lineWidth = rand(1, 2.4); g.stroke();
     }
   });
   roadDetailTex.encoding = THREE.LinearEncoding;
@@ -287,7 +455,19 @@ const PLUG = window.PODA || {};
 PLUG.vehicles = PLUG.vehicles || {}; PLUG.districts = PLUG.districts || {};
 let streetAssets, freight, lumleyDetails, roles;
 const trafficPool = new TrafficPool(bake);
-function pooled(key, factory) { return trafficPool.acquire(key, factory); }
+const makeSendMe = createSendMeFactory(bake);
+const sendMeFrame = {};
+function pooled(key, factory) {
+  const o = trafficPool.acquire(key, factory);
+  const kind = key.startsWith('benchmark') ? null : /^(box|flatbed|tipper|tanker|container|coach)\d+$/.test(key) ? 'freight' : key;
+  if (['poda','taxi','kekeh','okada','sendme','waka','freight'].includes(kind)) attachVehicleLights(o.g, kind, { length:o.len });
+  if (key.startsWith('pothole') && !o.g.userData.nightRim) {
+    const rim = new THREE.Mesh(new THREE.RingGeometry(.44,.55,20).rotateX(-Math.PI/2), new THREE.MeshBasicMaterial({ color:0x777f7f, transparent:true, opacity:.45, depthWrite:false, side:THREE.DoubleSide }));
+    rim.position.y=.043; rim.scale.setScalar(o.wid/1.8); rim.visible=false;
+    o.g.add(rim); o.g.userData.nightRim=rim;
+  }
+  return o;
+}
 function releaseObstacle(o) { if (o.poolKey) trafficPool.release(o); else drop(o.g); }
 const kit = {};   // filled at boot; handed to every plug-in
 function makePerson(opt = {}) {
@@ -379,8 +559,8 @@ function makeKekeh() {
   const d = makePerson({ lappa: false, role: 'driver' }); d.rotation.y = Math.PI; d.position.set(0, 0.35, -0.6); d.scale.setScalar(0.85); g.add(d);
   return { g, wid: 1.5, len: 2.8 };
 }
-function makeOkada() {
-  if (PLUG.vehicles.okada) return PLUG.vehicles.okada(kit);
+function makeOkada(options = {}) {
+  if (PLUG.vehicles.okada) return PLUG.vehicles.okada(kit, options);
   const g = new THREE.Group();
   add(g, G.box, pick([0xd8333a, 0x1c1c1c, 0x2a7de1]), 0.32, 0.45, 1.5, 0, 0.7, 0, true);
   add(g, G.cyl, 0x161616, 0.62, 0.14, 0.62, 0, 0.32, -0.75).rotation.z = Math.PI / 2;
@@ -388,6 +568,8 @@ function makeOkada() {
   const r = makePerson({ lappa: false, cast: true, role: 'rider' }); r.rotation.y = Math.PI; r.position.set(0, 0.3, -0.15); r.scale.setScalar(0.9); g.add(r);
   add(g, G.sph, 0xd8333a, 0.4, 0.38, 0.42, 0, 1.86, -0.15);
   const p = makePerson({ cast: true, role: 'rider' }); p.rotation.y = Math.PI; p.position.set(0, 0.36, 0.45); p.scale.setScalar(0.88); g.add(p);
+  g.userData.passenger = p;
+  if (options.player) p.visible = false;
   return { g, wid: 0.9, len: 1.9, weave: true };
 }
 function makeCar() {
@@ -440,20 +622,23 @@ let chunkSerial = 0;
 const hy = ax => Math.max(0, ax - 11) * 0.42;
 
 function buildStatic() {
-  const road = new THREE.Mesh(new THREE.PlaneGeometry(ROAD_HALF * 2, 200), new THREE.MeshStandardMaterial({ map: roadTex, bumpMap: roadDetailTex, bumpScale: .035, roughnessMap: roadDetailTex, roughness: .96, metalness: 0 }));
-  road.rotation.x = -Math.PI / 2; road.position.set(0, 0, -90); road.receiveShadow = true; scene.add(road);
+  // The straight road and its backdrop; the CBD mode hides this and draws real streets.
+  const staticRoot = new THREE.Group(); staticRoot.name = 'street-static'; scene.add(staticRoot);
+  const road = new THREE.Mesh(new THREE.PlaneGeometry(ROAD_HALF * 2, 200), new THREE.MeshStandardMaterial({ map: roadTex, bumpMap: roadDetailTex, bumpScale: .05, roughnessMap: roadDetailTex, roughness: .9, metalness: 0 }));
+  environment.addRoad(road.material);
+  road.rotation.x = -Math.PI / 2; road.position.set(0, 0, -90); road.receiveShadow = true; staticRoot.add(road);
   for (const s of [-1, 1]) {
     const channel = new THREE.Mesh(new THREE.PlaneGeometry(.36, 200), M(0x343a36));
-    channel.rotation.x = -Math.PI / 2; channel.position.set(s * (ROAD_HALF + .18), .025, -90); scene.add(channel);
+    channel.rotation.x = -Math.PI / 2; channel.position.set(s * (ROAD_HALF + .18), .025, -90); staticRoot.add(channel);
     const walk = new THREE.Mesh(new THREE.PlaneGeometry(2.64, 200), new THREE.MeshStandardMaterial({ map: walkTex, roughness: 1 }));
     walk.rotation.x = -Math.PI / 2; walk.position.set(s * (ROAD_HALF + 1.68), 0.2, -90); walk.receiveShadow = true;
     if (s < 0) walk.scale.x = -1; // mirror wear onto the roadside edge
-    scene.add(walk);
-    add(scene, G.box, 0x89867b, 0.22, 0.22, 200, s * (ROAD_HALF + 0.05), 0.1, -90);
-    add(scene, G.box, 0x75766b, .12, .22, 200, s * (ROAD_HALF + .36), .1, -90);
+    staticRoot.add(walk);
+    add(staticRoot, G.box, 0x89867b, 0.22, 0.22, 200, s * (ROAD_HALF + 0.05), 0.1, -90);
+    add(staticRoot, G.box, 0x75766b, .12, .22, 200, s * (ROAD_HALF + .36), .1, -90);
   }
   const ground = new THREE.Mesh(new THREE.PlaneGeometry(500, 600), M(0x8a745c));
-  ground.rotation.x = -Math.PI / 2; ground.position.set(0, -0.02, -250); ground.receiveShadow = true; scene.add(ground);
+  ground.rotation.x = -Math.PI / 2; ground.position.set(0, -0.02, -250); ground.receiveShadow = true; staticRoot.add(ground);
 
   // Layered peninsula ridges replace isolated geometric peaks. Both are cheap single meshes.
   const ridgeHeight = (x, near) => (near ? 37 : 77) + Math.sin(x * .011 + (near ? 1 : 0)) * (near ? 12 : 24)
@@ -466,7 +651,8 @@ function buildStatic() {
     }
     const geo = new THREE.BufferGeometry(); geo.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
     const mesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color: new THREE.Color(color).convertSRGBToLinear(), side: THREE.DoubleSide, fog: false }));
-    scene.add(mesh);
+    environment.addBackdrop(mesh.material, color, 0x27374b);
+    staticRoot.add(mesh);
   }
   ridge(-495, false, 0x68858d);
   ridge(-410, true, 0x617d73);
@@ -477,15 +663,18 @@ function buildStatic() {
     add(hillHouses, G.box, pick([0x968f79, 0xb3aa94, 0x819687, 0x9b8374, 0x879497]), w, h, .5, x, y, z);
     if (Math.random() < .6) add(hillHouses, G.box, pick([0x7e655a, 0x76776e, 0x807f75]), w + .2, .45, .65, x, y + h / 2, z);
   }
-  scene.add(hillHouses); bake(hillHouses);
-  for (const m of hillHouses.children) m.material = new THREE.MeshBasicMaterial({ vertexColors: true, fog: false });
+  staticRoot.add(hillHouses); bake(hillHouses);
+  for (const m of hillHouses.children) { m.material = new THREE.MeshBasicMaterial({ vertexColors: true, fog: false }); environment.addBackdrop(m.material, 0xffffff, 0x586071); }
   const cloudG = new THREE.Group();
   for (let i = 0; i < 6; i++) {
     const cx = rand(-320, 320), cy = rand(120, 190), cz = rand(-520, -380);
     for (let j = 0; j < 4; j++) add(cloudG, G.sph, 0xffffff, rand(18, 34), rand(8, 13), rand(10, 16), cx + j * 14 - 20, cy + rand(-2, 3), cz + rand(-4, 4));
   }
-  scene.add(cloudG); bake(cloudG);
-  for (const m of cloudG.children) m.material = new THREE.MeshLambertMaterial({ vertexColors: true, emissive: 0xa8b6bc, fog: false });
+  staticRoot.add(cloudG); bake(cloudG);
+  for (const m of cloudG.children) {
+    m.material = new THREE.MeshLambertMaterial({ vertexColors: true, emissive: 0xa8b6bc, fog: false });
+    environment.subscribe(p => { m.material.emissive.setHex(0xa8b6bc).lerp(new THREE.Color(0x111d30),p.backdrop); m.material.color.setHex(0xffffff).lerp(new THREE.Color(0x51617b),p.backdrop); });
+  }
 
   // hillside slopes, one pair per chunk
   const slope = (s) => {
@@ -557,6 +746,7 @@ function districtFor(distAhead) {
   return stopName(distAhead < toStop ? idx : idx + 1);
 }
 function fillChunk(ch) {
+  if (cbd) return;                      // CBD scenery is static and geographic, not chunked
   const u = ch.userData, c = u.content;
   c.traverse(m => { if (m.userData.baked) m.geometry.dispose(); });
   while (c.children.length) c.remove(c.children[0]);
@@ -586,6 +776,7 @@ function fillChunk(ch) {
     add(c, G.box, 0x545b55, .29, .015, .58, x, .036, z);
     for (const dz of [-.18, 0, .18]) add(c, G.box, 0x252b28, .22, .003, .035, x, .046, z + dz);
   }
+  for (const side of [-1,1]) add(c, G.box, 0x686d72, .13, 6.8, .13, side*(ROAD_HALF+1.2), 3.4, -CH/2);
   if (PLUG.people) PLUG.people.lodDefault = undefined;
   const trimmed=[];c.traverse(o=>{if(o.userData.decorativePerson&&Math.random()>qualityManager.budget.crowd)trimmed.push(o);});for(const person of trimmed)person.parent?.remove(person);
   bake(c);
@@ -641,6 +832,7 @@ function bake(root, cast = false) {
 }
 function drop(obj) {
   world.remove(obj);
+  obj.userData.vehicleLights?.dispose();
   for(const texture of obj.userData.ownedTextures||[])texture.dispose();
   obj.traverse(m => { if (m.userData.baked) m.geometry.dispose(); });
 }
@@ -670,8 +862,11 @@ function defaultFill(c) {
 const RULES = window.PODA_RUN_RULES;
 const CONFIG = window.PODA_CONFIG;
 let vehicleId = CONFIG.vehicles[store.get('poda-vehicle')] ? store.get('poda-vehicle') : 'poda';
-let routeId = CONFIG.routes[store.get('poda-route')] ? store.get('poda-route') : 'western';
+let routeId = CBD_FLAG ? 'central' : CONFIG.routes[store.get('poda-route')] ? store.get('poda-route') : 'western';
 let CAP = CONFIG.vehicles[vehicleId].capacity;
+const routeStops = () => cbd ? cbd.stopNames : CONFIG.routes[routeId].stops;
+const routeKey = () => routeId;
+const routeName = id => id === 'cbd' ? 'Freetown Central' : CONFIG.routes[id]?.name;
 DATA.route = CONFIG.routes[routeId].stops;
 const S = {};
 let player, apprentice, contactShadow, workshop;
@@ -682,13 +877,40 @@ const clock = new window.PODA_GameClock();
 const events = new window.PODA_EventBus();
 const missions = new window.PODA_MissionSystem(events, store);
 const api = new window.PODA_ApiClient(store, fetch.bind(window), () => crypto.randomUUID());
-let runSerial = 0, lastResult=null, resultVehicle=null, resultRoute=null, resultModel=null;
+let onlineRun = null, accountUI = null, streakUI = null;
+let runSerial = 0, lastResult=null, verifiedScoreRank=null;
 let garageReturnState = 'attract';
 let garageHidden = [];
 let state = stateMachine.current, demo = location.hash === '#demo' || new URLSearchParams(location.search).has('district');
 function changeState(next) { state = stateMachine.transition(next); }
 const inputManager = new window.PODA_InputManager({ moveLane: laneTo, horn, pause: () => state === 'paused' ? resumeRun() : pauseRun(), mute: toggleMute });
 const input = inputManager.state;
+
+// Explicit local-only diagnostics. Normal players never create these objects.
+const trafficDebug = (() => {
+  if (!params.has('trafficDebug') || !['localhost','127.0.0.1'].includes(location.hostname)) return null;
+  const label=document.createElement('pre');
+  label.style.cssText='position:fixed;left:8px;top:8px;z-index:9999;margin:0;padding:10px;background:#07131ddd;color:#bfffe4;font:12px/1.4 monospace;pointer-events:none;white-space:pre';
+  document.body.append(label);
+  const material=new THREE.MeshBasicMaterial({color:0x00ff88,wireframe:true,depthTest:false,transparent:true,opacity:.85});
+  const boxes=[];
+  function box(index) {
+    if(!boxes[index]){boxes[index]=new THREE.Mesh(new THREE.BoxGeometry(1,1,1),material);boxes[index].renderOrder=999;scene.add(boxes[index]);}
+    boxes[index].visible=true;return boxes[index];
+  }
+  return {objects:boxes,update(dt){
+    const playerBox=box(0);playerBox.position.set(S.x,1.1,0);playerBox.scale.set((S.vehicle?.width||2.1)-.3,2.2,(S.vehicle?.length||5.4)-.3);
+    let nearest=null, distance=Infinity;
+    for(let i=0;i<obstacles.length;i++){
+      const o=obstacles[i], mesh=box(i+1);
+      mesh.position.set(o.x,1.1,o.z);mesh.scale.set(o.wid-.3,2.2,o.len-.3);
+      const gap=Math.abs(o.z)-(o.len+(S.vehicle?.length||5.4))/2;
+      if(gap<distance){nearest=o;distance=gap;}
+    }
+    for(let i=obstacles.length+1;i<boxes.length;i++)boxes[i].visible=false;
+    label.textContent=`PLAYER SPEED ${S.speed.toFixed(1)} m/s\nNPC SPEED ${nearest?.speed.toFixed(1)??'—'} m/s\nRELATIVE ${(nearest?S.speed-nearest.speed:0).toFixed(1)} m/s\nDISTANCE ${nearest?distance.toFixed(1):'—'} m\nPLAYER LANE ${S.lane}\nNPC LANE ${nearest?.lane??'—'}\nFOLLOWING GAP ${nearest&&Number.isFinite(nearest.leaderGap)?nearest.leaderGap.toFixed(1):'—'} m\nDELTA ${(dt*1000).toFixed(1)} ms\nCOLLISION ${nearest?window.PODA_CollisionSystem.overlapsPlayer(S,nearest):false}`;
+  }};
+})();
 
 function resetRun() {
   inputManager.release();
@@ -704,9 +926,13 @@ function resetRun() {
     perfectStops: 0, missedStops: 0, collisions: 0, lost: 0, completed: false,
     stopIdx: 1, toStop: 260, legLen: 260, nextRow: 60,
     pax: [], hitAt: -99, invuln: 0, dwell: 0, dwellPlan: null, shake: 0, magnet: 0, time: 0, over: false,
+    // style multiplier, overshoot recovery and body condition
+    style: 0, fastTime: 0, multiplier: 1,
+    reversing: false, reverseSpeed: RULES.REVERSE_SPEED, condition: RULES.CONDITION,
   });
-  // start half-full; each passenger knows where they're going
-  for (let i = 0; i < Math.ceil(CAP / 2); i++) S.pax.push(randi(0, 2));
+  // Buses start half-full; the motorcycle starts ready for its first pickup.
+  if (cbd) { cbd.reset(); S.toStop = S.legLen = cbd.distanceToStop(1); }
+  for (let i = 0; i < (vehicleId === 'okada' ? 0 : Math.ceil(CAP / 2)); i++) S.pax.push(randi(0, 2));
   for (let z = -45; z > -200; z -= 36) spawnRow(z);
   renderSeats(); renderBody();
 }
@@ -731,7 +957,7 @@ function spawnStop() {
   g.userData.ownedTextures=[zone,sign.material.map];
   const zm = new THREE.Mesh(new THREE.PlaneGeometry(3.0, 16), new THREE.MeshBasicMaterial({ map: zone, transparent: true, opacity: 0.85, depthWrite: false }));
   zm.rotation.x = -Math.PI / 2; zm.position.set(LANES[2], 0.03, 0); g.add(zm);
-  const d0 = PLUG.districts[forcedDistrict || stopName(S.stopIdx)];
+  const d0 = cbd ? null : PLUG.districts[forcedDistrict || stopName(S.stopIdx)];
   if (d0 && d0.landmark) d0.landmark(g, kit, { name: stopName(S.stopIdx) });
   bake(g);
   const waiting = [];
@@ -750,8 +976,15 @@ function beginDwell() {
   S.pax = remaining;
   S.dwell = 1.4 + 0.18 * (dropN + board);
   S.dwellPlan = { dropN, board, perfect: RULES.stopGrade(s.z) === 'perfect' };
-  const door = new THREE.Vector3(S.x + 1.3, 0.2, -0.75 - s.z);
-  s.waiting.slice(0, board).forEach((p, i) => s.walkers.push({ p, to: door.clone(), delay: i * 0.18, vanish: true }));
+  const bike = vehicleId === 'okada';
+  const door = new THREE.Vector3(S.x + (bike ? 0.6 : 1.3), 0.2, (bike ? 0.5 : -0.75) - s.z);
+  const boardingDelay = bike && dropN ? 1.2 : 0;
+  if (bike) {
+    renderSeats();
+    const walkTime = board ? s.waiting[0].position.distanceTo(door) / 3.2 : 0;
+    S.dwell = Math.max(1.2, boardingDelay + walkTime + 0.6);
+  }
+  s.waiting.slice(0, board).forEach((p, i) => s.walkers.push({ p, to: door.clone(), delay: boardingDelay + i * 0.18, vanish: true }));
   for (let i = 0; i < dropN; i++) {
     const p = makePerson({ cast: true }); p.position.copy(door); s.g.add(p);
     s.walkers.push({ p, to: new THREE.Vector3(ROAD_HALF + rand(2, 3), 0.2, door.z + rand(-3, 3)), delay: i * 0.18, vanish: false });
@@ -760,7 +993,7 @@ function beginDwell() {
 }
 function finishDwell() {
   const { dropN, board, perfect } = S.dwellPlan;
-  const earned = dropN * DATA.fare + (perfect ? 5 : 0);
+  const earned = dropN * DATA.fare + (perfect ? RULES.PERFECT_FARE : 0);
   S.cash += earned; S.dropped += dropN; S.stops++;
   if (perfect) S.perfectStops++;
   events.emit('stop:served', { stop: stopName(S.stopIdx), grade: perfect ? 'perfect' : 'served', passengersDropped: dropN, passengersBoarded: board, earned });
@@ -776,7 +1009,7 @@ function advanceStop() {
   if (S.stopIdx === DATA.route.length - 1) { endRun(true); return; }
   S.pax = window.PODA_PassengerSystem.advanceDestinations(S.pax);
   S.stopIdx = S.stopIdx + 1;
-  S.legLen = S.toStop = rand(420, 560);
+  S.legLen = S.toStop = cbd ? cbd.distanceToStop(S.stopIdx) : rand(420, 560);
 }
 function missStop() {
   const s = stopObj; s.missed = true;
@@ -801,9 +1034,11 @@ function initCoins() {
   world.add(coinIM);
 }
 function coinFree(c) { _cm.makeScale(0, 0, 0); coinIM.setMatrixAt(c.slot, _cm); coinSlots.push(c.slot); }
-const LANE_SPEED = [10.5, 8, 5.5];
+// Metres per second. Keep lane character while preserving a readable closing rate.
+const LANE_SPEED = [22, 20, 18];
 const heading = o => (o.person ? (o.vx > 0 ? Math.PI / 2 : -Math.PI / 2) : (o.vx > 0 ? -Math.PI / 2 : Math.PI / 2));
 function spawnRow(z) {
+  if (cbd && !cbd.canSpawnAt(z)) return;   // keep corners and the blind run after them clear
   const prog = clamp(S.dist / 5000, 0, 1);
   const n = Math.random() < 0.3 + 0.35 * prog ? 2 : 1;
   const stopZ = -S.toStop;
@@ -811,7 +1046,7 @@ function spawnRow(z) {
   let placed = 0;
   for (const lane of lanes) {
     if (placed >= n) break;
-    if (lane === 2 && Math.abs(z - stopZ) < 55) continue;
+    if (lane === 2 && (Math.abs(z - stopZ) < 55 || (cbd && cbd.nearStop(z, 55)))) continue;   // CBD stops sit closer than one spawn horizon apart
     if(obstacles.some(o=>Math.abs(o.z-z)<22&&Math.abs(o.x-LANES[lane])<3))continue;
     const district=districtFor(-z);
     const freightDistrict=['Cline Town','Wellington','Kissy'].includes(district);
@@ -819,21 +1054,29 @@ function spawnRow(z) {
     let o, speed = LANE_SPEED[lane], cross = 0;
     if (r < 0.18) o = pooled('taxi', makeCar);
     else if (r < 0.34) o = pooled('kekeh', makeKekeh);
-    else if (r < 0.46) o = pooled('okada', makeOkada);
+    else if (r < 0.46) o = window.PODA_SendMe.config.enabled && Math.random() < window.PODA_SendMe.config.motorcycleShare ? pooled('sendme', makeSendMe) : pooled('okada', makeOkada);
     else if (r < 0.56) o = pooled('poda', makeTrafficPoda);
-    else if (r < 0.62) { o = lane === 2 ? pooled('kekeh', makeKekeh) : pooled('waka', makeWakaFine); speed = 4; }
-    else if (r < 0.70) { const type=pick(['box','flatbed','tipper','tanker','container','coach']), variant=randi(0,2); o=pooled(type+variant,()=>freight.make({type,variant})); speed=4; }
+    else if (r < 0.62) { o = lane === 2 ? pooled('kekeh', makeKekeh) : pooled('waka', makeWakaFine); speed = LANE_SPEED[lane] * .78; }
+    else if (r < 0.70) { const type=pick(['box','flatbed','tipper','tanker','container','coach']), variant=randi(0,2); o=pooled(type+variant,()=>freight.make({type,variant})); speed=LANE_SPEED[lane] * .7; }
     else if(r<.73) {const g=new THREE.Group();streetAssets.roadworks(g,0,0);o={g,wid:2.1,len:8,static:true};speed=0;}
     else if (r < 0.74) { o = makeGoat(); speed = 0; cross = 1; }
     else if (r < 0.84) { o = makeHawker(); speed = 0; cross = 1; }
     else if(r<.89){const g=new THREE.Group();add(g,G.box,0xe1a242,1.6,.35,.5,0,.18,0);o={g,wid:1.6,len:.5,static:true,jumpable:true};speed=0;}
     else { const v=randi(0,4); o=pooled('pothole'+v,()=>streetAssets.pothole(v)); speed=0; }
+    if (speed > 0) {
+      const paceRoll = Math.random();
+      const pace = paceRoll < .18 ? rand(.82,.93) : paceRoll < .78 ? rand(.96,1.06) : rand(1.07,1.15);
+      speed *= pace;
+      o.passSide = Math.random() < .5 ? -1 : 1;
+      o.passLead = rand(2.5,3.3);
+    }
     o.cruise=speed; o.weave=false; o.lane = lane; o.speed = speed; o.z = z; o.x = LANES[lane];
     if (cross) {
       const dir = Math.random() < 0.5 ? -1 : 1;
       o.vx = dir * rand(0.9, 1.5); o.crossVelocity=o.vx; o.x = LANES[lane] - dir * 2.2; o.cross = true;
       o.g.rotation.y = heading(o);
     } else if (!o.poolKey && !o.flat && !o.person) bake(o.g, true);
+    if (o.static || o.person || o.cross) environment.addReadableObject(o.g);
     o.g.position.set(o.x, 0, z);
     world.add(o.g); obstacles.push(o); placed++;
   }
@@ -869,9 +1112,14 @@ function hit(o) {
   if (state !== 'play') return;
   S.collisions++;
   events.emit('collision', { type: o.flat ? 'pothole' : 'traffic', collisions: S.collisions });
-  const second = S.time - S.hitAt < 4;
+  // The poda carries a condition of 3. A knock costs one; a knock while still
+  // shaken costs two, so carelessness still ends a shift without a single
+  // mistimed overtake doing it.
+  const damage = RULES.collisionDamage({ condition: S.condition, time: S.time, hitAt: S.hitAt });
+  S.condition = damage.remaining;
   S.hitAt = S.time; S.invuln = 1.0;
-  if (second) { endRun(); return; }
+  S.fastTime = 0; S.multiplier = 1;
+  if (damage.fatal) { endRun(); return; }
   S.speed *= 0.4;
   const bail = Math.min(S.pax.length, randi(1, 3));
   S.pax.splice(0, bail);
@@ -889,7 +1137,8 @@ function laneTo(d) {
   S.lane = clamp(S.lane + d, 0, 2);
 }
 addEventListener('keydown', e => {
-  if(e.target?.matches?.('input,select,textarea,button'))return;
+  if (e.key === 'Escape' && $('radio').classList.contains('music-open')) { setMusicOpen(false); $('musicToggle').focus(); e.preventDefault(); return; }
+  if(e.target?.closest?.('input,select,textarea,button,summary,a,dialog'))return;
   if (e.repeat && !['ArrowDown', 's', 'S', ' ', 'ArrowUp', 'w', 'W'].includes(e.key)) return;
   if (e.key === 'p' || e.key === 'P' || e.key === 'Escape') {
     if (state === 'play' || state === 'paused') inputManager.command('PAUSE');
@@ -902,6 +1151,7 @@ addEventListener('keydown', e => {
     else if (e.key === 'ArrowUp' || e.key === 'w' || e.key === 'W') { inputManager.command('ACCELERATE'); e.preventDefault(); }
     else if (e.key === ' ' && !e.repeat) { e.preventDefault(); jump(); }
     else if (e.key === 'h' || e.key === 'H') inputManager.command('HORN');
+    else if (e.key === 'r' || e.key === 'R') nextSong();
     else if (e.key === 'm' || e.key === 'M') inputManager.command('MUTE');
   } else if (state === 'attract' || state === 'over' || state === 'complete') {
     if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); startRun(); }
@@ -913,21 +1163,24 @@ addEventListener('keyup', e => {
 });
 function jump() { if(state==='play' && !demo && window.PODA_JumpSystem.start(S)) {events.emit('jump:start',{});tone(220,.12,'sine',.08,420);} }
 let touch0 = null;
-canvas.addEventListener('pointerdown', e => { if(e.isPrimary && !input.brake && !input.gas) {canvas.setPointerCapture(e.pointerId);touch0 = { x: e.clientX, y: e.clientY, time:performance.now(), id:e.pointerId };} });
+canvas.addEventListener('pointerdown', e => {
+  if (state !== 'play' || touch0) return;
+  canvas.setPointerCapture(e.pointerId);
+  touch0 = { x: e.clientX, y: e.clientY, time:performance.now(), id:e.pointerId };
+});
 canvas.addEventListener('pointerup', e => {
   if (!touch0 || touch0.id!==e.pointerId) return;
   const dx = e.clientX - touch0.x, dy = e.clientY - touch0.y, elapsed=performance.now()-touch0.time; touch0 = null;
-  if(input.brake || input.gas) return;
   if(window.PODA_JumpSystem.swipe(dx,dy,elapsed)) {jump();return;}
   if (Math.abs(dx) > 30 && Math.abs(dx) > Math.abs(dy)) inputManager.command(dx > 0 ? 'MOVE_RIGHT' : 'MOVE_LEFT');
   else if (dy > 40) inputManager.command('BRAKE_PULSE');
 });
-canvas.addEventListener('pointercancel',()=>touch0=null);
+canvas.addEventListener('pointercancel', e => { if (touch0?.id === e.pointerId) touch0 = null; });
 const brakeBtn = $('brakeBtn');
-brakeBtn.addEventListener('pointerdown', e => { touch0=null; e.preventDefault(); inputManager.command('BRAKE'); brakeBtn.classList.add('down'); hud3d?.control('brake', true); });
+brakeBtn.addEventListener('pointerdown', e => { e.preventDefault(); inputManager.command('BRAKE'); brakeBtn.classList.add('down'); hud3d?.control('brake', true); });
 for (const ev of ['pointerup', 'pointercancel', 'pointerleave']) brakeBtn.addEventListener(ev, () => { inputManager.command('BRAKE', false); brakeBtn.classList.remove('down'); hud3d?.control('brake', false); });
 const gasBtn = $('gasBtn');
-gasBtn.addEventListener('pointerdown', e => { touch0=null; e.preventDefault(); inputManager.command('ACCELERATE'); gasBtn.classList.add('down'); hud3d?.control('gas', true); });
+gasBtn.addEventListener('pointerdown', e => { e.preventDefault(); inputManager.command('ACCELERATE'); gasBtn.classList.add('down'); hud3d?.control('gas', true); });
 for (const ev of ['pointerup', 'pointercancel', 'pointerleave']) gasBtn.addEventListener(ev, () => { inputManager.command('ACCELERATE', false); gasBtn.classList.remove('down'); hud3d?.control('gas', false); });
 addEventListener('blur', () => inputManager.release());
 const hornBtn = $('hornBtn');
@@ -939,6 +1192,22 @@ $('againBtn').addEventListener('click', startRun);
 $('pauseBtn').addEventListener('click', pauseRun);
 $('resumeBtn').addEventListener('click', resumeRun);
 $('restartBtn').addEventListener('click', startRun);
+$('homeResult').addEventListener('click', returnHome);
+$('homePause').addEventListener('click', () => {
+  if (state !== 'paused') return;
+  endRun(); returnHome();
+});
+$('pauseMute').addEventListener('click', toggleMute);
+$('pauseMusic').addEventListener('click', () => $('auxFile').click());
+$('pause').addEventListener('keydown', event => {
+  if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); resumeRun(); }
+  if (event.key === 'Tab') {
+    const buttons = [...$('pause').querySelectorAll('button, select, summary')].filter(el => el.getClientRects().length);
+    const first=buttons[0], last=buttons.at(-1);
+    if (event.shiftKey && document.activeElement===first) { event.preventDefault(); last.focus(); }
+    else if (!event.shiftKey && document.activeElement===last) { event.preventDefault(); first.focus(); }
+  }
+});
 $('qualityProfile').addEventListener('change', e => { qualityManager.setProfile(e.target.value); store.set('poda-quality', e.target.value); });
 $('leadersTitle').addEventListener('click', showLeaderboard);
 $('leadersResult').addEventListener('click', showLeaderboard);
@@ -946,19 +1215,62 @@ $('missionsTitle').addEventListener('click', () => { $('missionsText').textConte
 $('missionsClose').addEventListener('click', () => $('missionsPanel').hidden=true);
 for(const button of document.querySelectorAll('[data-garage-category]')) button.addEventListener('click',()=>{ garageCategory=button.dataset.garageCategory; document.querySelectorAll('[data-garage-category]').forEach(b=>b.setAttribute('aria-pressed',String(b===button))); document.querySelectorAll('[data-garage-detail]').forEach(p=>p.hidden=p.dataset.garageDetail!==garageCategory); });
 $('chooseRide').addEventListener('click', openPlayerGarage);
+const titleHelp = $('titleHelp');
+$('titleHow').addEventListener('click', () => titleHelp.showModal());
+$('titleHelpClose').addEventListener('click', () => titleHelp.close());
+titleHelp.addEventListener('click', event => { if (event.target === titleHelp) titleHelp.close(); });
 for(const [id,v] of Object.entries(CONFIG.vehicles)) $('rideSelect').add(new Option(v.name,id));
 for(const [id,r] of Object.entries(CONFIG.routes)) $('routeSelect').add(new Option(r.name+' · '+r.difficulty,id));
 $('rideSelect').value=vehicleId; $('routeSelect').value=routeId;
+$('environmentSelect').value = store.get('poda-environment') === 'NIGHT' ? 'NIGHT' : 'DAY';
+$('environmentSelect').addEventListener('change', e => store.set('poda-environment', e.target.value));
+function updateTitleRoute() {
+ const ids=Object.keys(CONFIG.routes), index=ids.indexOf(routeId), route=CONFIG.routes[routeId];
+ $('titleRouteIndex').textContent=`ROUTE ${String(index+1).padStart(2,'0')} / ${String(ids.length).padStart(2,'0')} · ${cbd ? 'MAPPED STREETS' : route.difficulty.toUpperCase()}`;
+ $('titleRouteName').textContent=route.name;
+ $('titleRouteStops').textContent=`${route.stops[0]} → ${route.stops.at(-1)} · ${route.stops.length} stops`;
+}
+for (const [id, direction] of [['titleRoutePrev',-1],['titleRouteNext',1]]) $(id).addEventListener('click',()=>{
+ const ids=Object.keys(CONFIG.routes), index=ids.indexOf(routeId);
+ $('routeSelect').value=ids[(index+direction+ids.length)%ids.length];
+ $('routeSelect').dispatchEvent(new Event('change'));
+});
 function selectionDetails() {
  const v=CONFIG.vehicles[vehicleId],r=CONFIG.routes[routeId];
  $('rideStats').textContent=`${v.capacity} passengers · Speed ${Math.round(v.maxSpeed*3.6)} km/h · Handling ${Math.round(v.handling/18*5)}/5 · Braking ${Math.round(v.braking/30*5)}/5`;
- $('routeDescription').textContent=r.stops.join(' → ')+' · '+r.description+'. Condensed arcade route.';
+ $('routeDescription').textContent=cbd
+   ? 'Congo Cross → Cotton Tree → PZ → Eastern Police · 14 stops on one mapped drive. The CBD streets are part of this route. Bends turn automatically; steer between lanes. Scores stay on this device.'
+   : r.stops.join(' → ')+' · '+r.description+'. Condensed arcade route.';
+ centralStopDetails.hidden = !cbd;
+ if (cbd) {
+   const summary = document.createElement('summary'); summary.textContent = `View all ${cbd.stopNames.length} stops in order`;
+   const list = document.createElement('ol');
+   for (const name of cbd.stopNames) { const item = document.createElement('li'); item.textContent = name; list.append(item); }
+   centralStopDetails.replaceChildren(summary, list);
+ }
  document.querySelector('.garage-tabs').hidden=vehicleId!=='poda';
  for(const panel of document.querySelectorAll('[data-garage-detail]'))panel.hidden=vehicleId!=='poda'||panel.dataset.garageDetail!==garageCategory;
 }
+const centralStopDetails = document.createElement('details');
+centralStopDetails.className = 'central-stop-details';
+$('routeDescription').after(centralStopDetails);
 selectionDetails();
+updateTitleRoute();
 $('rideSelect').addEventListener('change',e=>{vehicleId=e.target.value;store.set('poda-vehicle',vehicleId);buildPlayer();selectionDetails();});
-$('routeSelect').addEventListener('change',e=>{routeId=e.target.value;store.set('poda-route',routeId);DATA.route=CONFIG.routes[routeId].stops;buildPlayer();selectionDetails();});
+$('routeSelect').addEventListener('change',e=>{
+  routeId=e.target.value; store.set('poda-route',routeId);
+  if (CBD_FLAG) { const url = new URL(location.href); url.searchParams.delete('cbd'); history.replaceState(null, '', url); }
+  if (routeId === 'central') {
+    if (!centralMode) {
+      centralMode = createCbdMode({ THREE, kit, scene, world, bake, textures: { road: roadTex, roadDetail: roadDetailTex, walk: walkTex } });
+      setupCbdLighting(centralMode);
+    }
+    cbd = centralMode;
+  } else { centralMode?.setVisible(false); cbd = null; }
+  PLUG.debug.cbd = cbd;
+  scene.getObjectByName('street-static').visible = !cbd;
+  DATA.route=routeStops(); buildPlayer(); selectionDetails(); updateTitleRoute();
+});
 for(const [id,key,fallback] of [['cargoSelect','poda-cargo','loaded'],['wheelSelect','poda-wheels','steel'],['hornSelect','poda-horn','classic'],['bodyPaint','poda-paint','default'],['rackSelect','poda-rack','fitted'],['bodyTrim','poda-trim','standard'],['routeBoard','poda-board','auto'],['stickerSelect','poda-sticker','none']]){
  $(id).value=store.get(key)||fallback;
  $(id).addEventListener('change',e=>{store.set(key,e.target.value);buildPlayer();if(id==='hornSelect')horn();});
@@ -973,8 +1285,19 @@ $('garageLivery').addEventListener('change', e => {
 $('garageSlogan').addEventListener('change', e => {
   selectedSlogan = e.target.value; store.set('poda-slogan', selectedSlogan); buildPlayer(); poseGarageCamera();
 });
-$('leaderClose').addEventListener('click', () => { $('leaderboard').hidden = true; });
-$('leaderPeriod').addEventListener('change', loadLeaderboard);
+const leaderModal = modal($('leaderboard'));
+$('leaderClose').addEventListener('click', () => leaderModal.close());
+$('leaderChange').addEventListener('click', () => accountUI?.open());
+$('accountPanel').addEventListener('close', () => { if ($('leaderboard').open) loadLeaderboard(); });
+for (const button of document.querySelectorAll('[data-leader-scope], [data-leader-period]')) {
+  button.addEventListener('click', () => {
+    const key = button.dataset.leaderScope ? 'leaderScope' : 'leaderPeriod';
+    $(key).value = button.dataset.leaderScope || button.dataset.leaderPeriod;
+    document.querySelectorAll(key === 'leaderScope' ? '[data-leader-scope]' : '[data-leader-period]')
+      .forEach(tab => tab.setAttribute('aria-pressed', String(tab === button)));
+    loadLeaderboard();
+  });
+}
 $('mute').addEventListener('click', toggleMute);
 addEventListener('visibilitychange', () => { if (document.hidden && state === 'play') pauseRun(); });
 
@@ -993,8 +1316,16 @@ function horn() {
    ================================================================ */
 let ac = null, muted = store.get('poda-muted') === '1';
 function audio() { if (!ac) { try { ac = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} } return ac; }
-function toggleMute() { muted = !muted; store.set('poda-muted', muted ? '1' : '0'); $('mute').textContent = 'Sound: ' + (muted ? 'off' : 'on'); }
-$('mute').textContent = 'Sound: ' + (muted ? 'off' : 'on');
+function syncSoundButtons() {
+  $('mute').textContent = muted ? '🔇' : '🔊';
+  $('mute').setAttribute('aria-label', muted ? 'Turn sound on' : 'Turn sound off');
+  $('mute').title = muted ? 'Turn sound on' : 'Turn sound off';
+  $('pauseMute').querySelector('span').textContent = muted ? '🔇' : '🔊';
+  $('pauseMute').querySelector('b').textContent = muted ? 'Sound off' : 'Sound on';
+  $('pauseMute').setAttribute('aria-pressed', String(!muted));
+}
+function toggleMute() { muted = !muted; store.set('poda-muted', muted ? '1' : '0'); syncSoundButtons(); if (muted) pauseRunAudio(); else playMusic(); aux.el.muted = muted || aux.muted; auxLabel(); }
+syncSoundButtons();
 function tone(f, dur, type, vol, f2, when = 0) {
   const a = audio(); if (!a || muted) return;
   const t = a.currentTime + when, o = a.createOscillator(), g = a.createGain();
@@ -1011,7 +1342,7 @@ function noise(dur, vol, cutoff) {
   s.connect(f).connect(g).connect(a.destination); s.start();
 }
 /* ---------- Music: a synthesised Salone afropop riddim, plus AUX for the player's own songs ----------
-   Plays while the poda is moving and drops right down while it's stopped. */
+   Plays throughout a run, including passenger stops; pauses with the game. */
 const music = { gain: null, noise: null, next: 0, step: 0 };
 const STEP = 60 / 104 / 4;                       // 16th notes at 104 bpm
 const ROOTS = [110, 87.31, 130.81, 98];          // Am – F – C – G
@@ -1019,15 +1350,23 @@ const CHORD = [[0, 3, 7], [0, 4, 7], [0, 4, 7], [0, 4, 7]];
 const KICK = [1,0,0,0, 0,0,1,0, 1,0,0,1, 0,0,0,0];
 const BASS = [1,0,0,1, 0,0,2,0, 1,0,0,1, 0,0,2,0];
 const STAB = [0,0,1,0, 0,0,0,1, 0,0,1,0, 0,0,0,1];
-// Default song while the poda moves. Streamed, not decoded, so it stays light on memory.
-// If the file isn't there (e.g. a public build without it), the synthesised riddim takes over.
-const DEFAULT_SONG = { name: 'Drizilik – Sabi Road', url: new URL('../audio/sabi-road.mp3', import.meta.url).href };
-const aux = { el: new Audio(), list: [DEFAULT_SONG], i: 0 };
-aux.el.preload = 'none'; aux.el.src = DEFAULT_SONG.url; aux.el.volume = 0;
+// Stream one song at a time; the Drive gesture unlocks browser audio playback.
+const SOUNDTRACK = [
+  { name: 'Go', artist: 'Drizilik', url: new URL('../audio/drizilik-go.mp3', import.meta.url).href },
+  { name: 'Audacity', artist: 'Drizilik · D4nny Beatz', url: new URL('../audio/drizilik-audacity.mp3', import.meta.url).href },
+  { name: 'Alpha and Omega', artist: 'Drizilik', url: new URL('../audio/drizilik-alpha-and-omega.mp3', import.meta.url).href },
+  { name: 'Sabi Road', artist: 'Drizilik', url: new URL('../audio/sabi-road.mp3', import.meta.url).href },
+  { name: 'Biya Mi', artist: 'Memmeshverz', url: new URL('../audio/memmeshverz-biya-mi.m4a', import.meta.url).href },
+];
+const aux = { el: new Audio(), list: [...SOUNDTRACK], i: 0, paused: false,
+  muted: store.get('poda-music-muted') === '1', blocked: false, pending: false, request: 0 };
+aux.el.id = 'soundtrackAudio'; aux.el.hidden = true; document.body.append(aux.el);
+aux.el.preload = 'none'; aux.el.src = aux.list[0].url; aux.el.volume = 0.65;
 aux.el.addEventListener('error', () => {
-  if (aux.list[aux.i] !== DEFAULT_SONG) return;
-  aux.list = aux.list.filter(t => t !== DEFAULT_SONG); aux.i = 0;
-  if (aux.list.length) aux.el.src = aux.list[0].url;
+  aux.request++; aux.pending = false;
+  aux.list.splice(aux.i, 1);
+  aux.i = aux.list.length ? aux.i % aux.list.length : 0;
+  if (aux.list.length) { aux.el.src = aux.list[aux.i].url; playMusic(); }
   auxLabel();
 });
 function musicInit() {
@@ -1062,17 +1401,9 @@ function playStep(i, t) {
 }
 function musicTick(dt) {
   const a = ac; if (!a || !music.gain) return;
-  const moving = state === 'play' && S.speed > 2 && S.dwell <= 0;
-  const level = muted ? 0 : state !== 'play' ? 0 : moving ? 1 : 0.15;
+  const level = muted || aux.muted || aux.paused || document.hidden || state !== 'play' ? 0 : 1;
   const usingAux = aux.list.length > 0;
   music.gain.gain.setTargetAtTime(usingAux ? 0 : level * 0.36, a.currentTime, 0.35);
-  if (usingAux) {
-    // songs play only while the poda moves: fade out and pause at stops, pick up where they left off
-    const want = level === 1 ? 0.85 : 0;
-    aux.el.volume = clamp(aux.el.volume + (want - aux.el.volume) * Math.min(1, dt * (want ? 2 : 4)), 0, 1);
-    if (aux.el.paused && want > 0) aux.el.play().catch(() => {});
-    if (want === 0 && aux.el.volume < 0.01 && !aux.el.paused) aux.el.pause();
-  }
   if (usingAux || level === 0) { music.next = a.currentTime + 0.05; return; } // idle: schedule nothing
   while (music.next < a.currentTime + 0.12) { playStep(music.step, music.next); music.next += STEP; music.step = (music.step + 1) % 64; }
 }
@@ -1106,25 +1437,93 @@ function engineTick() {
   engine.gain.gain.setTargetAtTime(on ? (S.speed < 0.5 ? 0.22 : 0.3 + 0.35 * sp) : 0, t, 0.2);
   engine.lp.frequency.setTargetAtTime(700 + 2600 * sp + (pushing ? 500 : 0), t, 0.2);
 }
-document.addEventListener('visibilitychange', () => {
+function pauseRunAudio() {
+  aux.request++; aux.pending = false;
+  aux.el.pause();
+  aux.el.volume = 0;
   if (!ac) return;
-  if (document.hidden) ac.suspend(); else ac.resume();   // stop all sound and audio work in background tabs
+  for (const gain of [music.gain?.gain, engine.gain?.gain]) {
+    if (!gain) continue;
+    gain.cancelScheduledValues(ac.currentTime);
+    gain.setValueAtTime(0, ac.currentTime);
+  }
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) { pauseRunAudio(); ac?.suspend(); }
+  else if (state === 'play') ac?.resume();
 });
+addEventListener('pagehide', () => { pauseRunAudio(); ac?.suspend(); });
+
+function setMusicOpen(open) {
+  $('radio').classList.toggle('music-open', open);
+  $('musicToggle').setAttribute('aria-expanded', String(open));
+  $('musicToggle').setAttribute('aria-label', open ? 'Close music controls' : 'Open music controls');
+}
+$('musicToggle').addEventListener('click', () => setMusicOpen(!$('radio').classList.contains('music-open')));
+canvas.addEventListener('pointerdown', () => setMusicOpen(false));
 
 function auxLabel() {
-  const t = aux.list.length ? aux.list[aux.i].name : 'Salone Riddim';
-  $('auxBtn').innerHTML = '♪ <b></b> · AUX'; $('auxBtn').querySelector('b').textContent = t;
+  const track = aux.list[aux.i];
+  $('musicTitle').textContent = track?.name || 'Salone Riddim';
+  $('musicArtist').textContent = track?.artist || (track ? 'Your music' : 'Poda Radio');
+  $('musicStatus').textContent = aux.blocked ? 'TAP PLAY TO LISTEN' : aux.paused ? 'MUSIC PAUSED' :
+    muted || aux.muted ? 'MUSIC MUTED' : 'PODA RADIO · ' + (track?.artist ? 'AUDACITY' : 'YOUR MIX');
+  $('musicPlay').textContent = aux.paused || aux.blocked ? '▶' : 'Ⅱ';
+  const label = aux.paused || aux.blocked ? 'Play music' : 'Pause music';
+  $('musicPlay').setAttribute('aria-label', label); $('musicPlay').title = label;
+  $('musicMute').textContent = aux.muted ? '♪×' : '♫';
+  $('musicMute').setAttribute('aria-label', aux.muted ? 'Unmute music' : 'Mute music');
+  $('musicMute').title = aux.muted ? 'Unmute music' : 'Mute music';
+  $('musicMute').setAttribute('aria-pressed', String(aux.muted));
+  $('musicNext').disabled = aux.list.length < 2;
+  const playing = state === 'play' && !document.hidden && !aux.el.paused && aux.el.readyState >= 3 && !aux.paused && !aux.muted && !muted && !aux.blocked;
+  $('musicPlayer').classList.toggle('is-playing', playing);
+  $('musicToggle').classList.toggle('is-playing', playing);
+  $('musicToggle').classList.toggle('is-quiet', aux.paused || aux.muted || muted || aux.blocked);
 }
-aux.el.addEventListener('ended', () => {
-  if (!aux.list.length) return; aux.i = (aux.i + 1) % aux.list.length; aux.el.src = aux.list[aux.i].url; aux.el.play().catch(() => {}); auxLabel(); });
+function playMusic() {
+  if (!aux.list.length || aux.paused || state !== 'play' || document.hidden || aux.pending) return;
+  aux.el.muted = muted || aux.muted;
+  aux.el.volume = 0.65;
+  aux.blocked = false;
+  const request = ++aux.request;
+  aux.pending = true;
+  aux.el.play().catch(error => {
+    if (request === aux.request && error.name !== 'AbortError') aux.blocked = true;
+  }).finally(() => {
+    if (request === aux.request) { aux.pending = false; auxLabel(); }
+  });
+}
+function nextSong() {
+  if (!aux.list.length) return;
+  aux.request++; aux.pending = false;
+  aux.i = (aux.i + 1) % aux.list.length;
+  aux.el.src = aux.list[aux.i].url;
+  playMusic(); auxLabel();
+}
+aux.el.addEventListener('ended', nextSong);
+for (const event of ['playing', 'pause', 'waiting', 'stalled', 'emptied', 'ended', 'volumechange']) aux.el.addEventListener(event, auxLabel);
+$('musicPlay').addEventListener('click', () => {
+  aux.paused = aux.blocked ? false : !aux.paused;
+  if (aux.paused) { aux.request++; aux.pending = false; aux.el.pause(); }
+  else playMusic();
+  auxLabel();
+});
+$('musicNext').addEventListener('click', nextSong);
+$('musicMute').addEventListener('click', () => {
+  aux.muted = !aux.muted; store.set('poda-music-muted', aux.muted ? '1' : '0');
+  aux.el.muted = muted || aux.muted; auxLabel();
+});
 $('auxBtn').addEventListener('click', () => $('auxFile').click());
 $('auxFile').addEventListener('change', e => {
   const files = [...e.target.files]; if (!files.length) return;
+  aux.request++; aux.pending = false; aux.el.pause();
   for (const t of aux.list) if (t.url.startsWith('blob:')) URL.revokeObjectURL(t.url);
   aux.list = files.map(f => ({ name: f.name.replace(/\.[^.]+$/, ''), url: URL.createObjectURL(f) }));
-  aux.i = 0; aux.el.src = aux.list[0].url; aux.el.volume = 0; auxLabel();
-  musicInit(); e.target.value = '';
+  aux.i = 0; aux.paused = false; aux.el.src = aux.list[0].url;
+  musicInit(); playMusic(); auxLabel(); e.target.value = '';
 });
+auxLabel();
 
 function sfx(k) {
   if (state !== 'play' && !demo) return;
@@ -1143,6 +1542,7 @@ const hudEls = { cash: $('cash'), dist: $('dist'), kmh: $('kmh'), stopName: $('s
 const seatsEl = $('seats');
 for (let i = 0; i < CAP; i++) seatsEl.appendChild(document.createElement('i'));
 function renderSeats() {
+  if (player?.userData.passenger && vehicleId === 'okada') player.userData.passenger.visible = S.pax.length > 0;
   if(seatsEl.children.length!==CAP){seatsEl.replaceChildren();for(let i=0;i<CAP;i++)seatsEl.appendChild(document.createElement('i'));}
   const drops = paxForStop();
   [...seatsEl.children].forEach((el, i) => { el.className = i < drops ? 'drop' : i < S.pax.length ? 'on' : ''; });
@@ -1150,16 +1550,45 @@ function renderSeats() {
 }
 function renderBody() {
   const shaken = S.time - S.hitAt < 4 && state === 'play';
+  const condition = S.condition == null ? RULES.CONDITION : S.condition;
   const els = $('body').children;
-  els[0].className = shaken ? 'off' : ''; els[1].className = '';
+  for (let i = 0; i < els.length; i++) els[i].className = i < condition ? '' : 'off';
+  $('body').setAttribute('role', 'img');
+  $('body').setAttribute('aria-label', 'Bus condition: ' + condition + ' of ' + els.length);
+  $('bodyLabel').textContent = condition <= 1 ? 'One more knock ends the run'
+    : shaken ? 'Shaken — tek tem' : 'Bus ready';
+}
+let lastRouteRail = '';
+function renderRouteRail() {
+  const key = routeId + ':' + S.stopIdx;
+  if (key === lastRouteRail) return;
+  lastRouteRail = key;
+  $('routeRail').classList.toggle('compact', DATA.route.length > 8);
+  $('routeRail').dataset.caption = `${Math.min(S.stopIdx + 1, DATA.route.length)} / ${DATA.route.length} · ${stopName(S.stopIdx)}`;
+  $('routeRail').replaceChildren(...DATA.route.map((name, index) => {
+    const stop = document.createElement('span');
+    stop.className = index < S.stopIdx ? 'passed' : index === S.stopIdx ? 'current' : '';
+    if(index === S.stopIdx) stop.setAttribute('aria-current','step');
+    stop.title = name;
+    const bar=document.createElement('i'), label=document.createElement('small');
+    label.textContent=name; stop.append(bar,label); return stop;
+  }));
+  $('routeRail').setAttribute('aria-label', `Next stop ${Math.min(S.stopIdx+1,DATA.route.length)} of ${DATA.route.length}: ${stopName(S.stopIdx)}`);
 }
 let lastHud = '';
 function updateHud() {
-  const key = [Math.round(S.cash), Math.round(S.dist / 10), Math.round(S.speed), S.stopIdx, Math.round(S.toStop / 5), S.pax.length, S.time - S.hitAt < 4].join('|');
+  const score = RULES.calculateScore(S);
+  const key = [score, S.coins, Math.round(S.cash), Math.round(S.dist / 10), Math.round(S.speed), S.stopIdx, Math.round(S.toStop / 5), S.pax.length, S.time - S.hitAt < 4, S.multiplier, S.condition, S.reversing].join('|');
   if (key === lastHud) return; lastHud = key;
   hudEls.cash.textContent = fmtLe(S.cash);
+  $('liveScore').textContent = score.toLocaleString('en-US');
+  const mult = $('liveMult');
+  mult.hidden = !(S.multiplier > 1);
+  if (S.multiplier > 1) mult.textContent = '×' + S.multiplier;
+  $('liveCoins').textContent = S.coins.toLocaleString('en-US');
+  renderRouteRail();
   hudEls.dist.textContent = (S.dist / 1000).toFixed(2) + ' km';
-  hudEls.kmh.textContent = Math.round(S.speed * 3.6) + ' km/h';
+  hudEls.kmh.textContent = S.speed < -0.2 ? 'R' : Math.round(Math.max(0, S.speed) * 3.6) + ' km/h';
   hudEls.stopName.textContent = stopName(S.stopIdx);
   hudEls.stopDist.textContent = Math.max(0, Math.round(S.toStop)) + ' m';
   const d = paxForStop();
@@ -1175,6 +1604,16 @@ function updateHud() {
     drops: d, progress: progress / 100,
   });
 }
+/* Approach cues. RunRules.stopGuidance picks the key; the wording lives here. */
+const STOP_CUES = {
+  loading:   () => 'Loading passengers…',
+  ahead:     m => `${stopName(S.stopIdx).toUpperCase()} · ${m} m`,
+  keepRight: m => `STOP IN ${m} m · KEEP RIGHT <kbd>→</kbd>`,
+  ready:     m => `STOP IN ${m} m · EASE OFF <kbd>↓</kbd>`,
+  brake:     () => 'BRAKE IN THE YELLOW BOX <kbd>↓</kbd>',
+  overshot:  m => `YOU PASSED IT BY ${m} m · HOLD <kbd>↓</kbd> TO BACK UP`,
+  reversing: () => 'HOLD THE BRAKE · BACKING UP',
+};
 function setHint(html) {
   if (hudEls.hint.innerHTML !== html) hudEls.hint.innerHTML = html;
   hudEls.hint.hidden = !html;
@@ -1194,7 +1633,9 @@ function say(kind, idx) {
   const [kr, en] = idx != null ? lines[idx] : pick(lines);
   while (popsEl.children.length > 2) popsEl.firstChild.remove();
   const el = document.createElement('div'); el.className = 'pop krio';
-  el.innerHTML = `${kr}<small>${en}</small>`;
+  // Attribute the line to the apprentice hanging out of the door — he is already
+  // modelled and animated, so the voice should visibly belong to someone.
+  el.innerHTML = `<b class="who">Apprentice</b>${kr}<small>${en}</small>`;
   if (hud3d) hud3d.pop(kr, 'krio', en);
   popsEl.appendChild(el); setTimeout(() => el.remove(), 2200);
 }
@@ -1210,7 +1651,9 @@ function startRun() {
   transitionTime = reduceMotion || demo ? 0 : 1.3;
   if (workshop) workshop.visible = false;
   world.visible = true;
-  CAP=CONFIG.vehicles[vehicleId].capacity; DATA.route=CONFIG.routes[routeId].stops; buildPlayer();
+  CAP=CONFIG.vehicles[vehicleId].capacity; DATA.route=routeStops(); buildPlayer();
+  // Fixed for the whole run; saved choice is explicit and independent of local time.
+  environment.setState($('environmentSelect').value === 'NIGHT' ? 'NIGHT' : 'DAY');
   resetRun();
   for(const ch of chunks) fillChunk(ch);
   changeState('play');
@@ -1218,41 +1661,68 @@ function startRun() {
   garageHidden = [];
   $('playerGarage').hidden = true;
   $('pause').hidden = true;
+  $('radio').inert = false;
+  setMusicOpen(false);
+  $('hud').inert = false;
+  lastHud = ''; lastRouteRail = '';
   $('title').hidden = true; $('over').hidden = true; $('hud').hidden = false; $('touch').hidden = false; $('radio').hidden = false;
-  musicInit(); engineInit();
+  musicInit(); engineInit(); playMusic();
   popsEl.innerHTML = '';
-  pop('Swipe to steer · swipe up / Space to hop low debris');
+  pop('Hold GAS · swipe the road to steer');
   updateHud();
   canvas.focus?.();
   events.emit('game:start', { route: DATA.route });
-  // New vehicle/route scores are local until the online validator supports this ruleset.
+  onlineRun = api.start({ route: routeKey(), vehicle: vehicleId, gameVersion: RULES.GAME_VERSION,
+    practice: demo || benchmark || params.has('sendme') || !!forcedDistrict });
+  streakUI?.started({ route: routeKey(), vehicle: vehicleId, handle: onlineRun,
+    practice: demo || benchmark || params.has('sendme') || !!forcedDistrict });
 }
 function pauseRun() {
   if (state !== 'play') return;
   changeState('paused');
+  pauseRunAudio();
   inputManager.release();
+  setMusicOpen(false);
+  $('pauseTripStats').textContent = 'Fares ' + $('cash').textContent + ' · Distance ' + $('dist').textContent;
   $('pause').hidden = false; $('touch').hidden = true;
+  $('radio').inert = true;
+  $('hud').inert = true;
+  $('pauseGoals').replaceChildren(...missions.status().map(mission => {
+    const row=document.createElement('div'), label=document.createElement('label'), amount=document.createElement('b'), progress=document.createElement('progress');
+    progress.id='pause-goal-'+mission.id; progress.max=mission.target; progress.value=mission.progress;
+    label.htmlFor=progress.id; label.textContent=mission.label;
+    amount.textContent=mission.complete?'Done':`${mission.progress}/${mission.target}`;
+    row.className=mission.complete?'goal-done':''; row.append(label,amount,progress); return row;
+  }));
+  syncSoundButtons(); $('resumeBtn').focus();
   events.emit('game:pause', {});
 }
 function resumeRun() {
   if (state !== 'paused') return;
-  changeState('play'); clock.reset(); canvas.focus();
+  ac?.resume();
+  changeState('play'); clock.reset(); canvas.focus(); playMusic();
   $('pause').hidden = true; $('touch').hidden = false;
+  $('radio').inert = false;
+  $('hud').inert = false;
   events.emit('game:resume', {});
 }
 function endRun(completed = false) {
   if (state === 'over' || state === 'complete') return;
   changeState(completed ? 'complete' : 'over');
+  pauseRunAudio();
   S.over = true; S.completed = completed;
+  inputManager.release();
+  $('pause').hidden = true; $('radio').hidden = true; $('touch').hidden = true; $('hud').hidden = true;
+  $('shareStatus').textContent = '';
+  $('over').classList.toggle('run-complete', completed);
   const result = RULES.summarize(S);
-  lastResult={...result,id:crypto.randomUUID(),date:Date.now(),vehicle:vehicleId,route:routeId};resultVehicle=CONFIG.vehicles[vehicleId].name;resultRoute=CONFIG.routes[routeId].name;
-  if(resultModel)resultModel.traverse(m=>{if(m.isMesh)m.geometry.dispose();});
-  resultModel=player.clone(true);resultModel.traverse(m=>{if(m.isMesh)m.geometry=m.geometry.clone();});
+  verifiedScoreRank=null;
+  lastResult={...result,durationMs:Math.round(S.time*1000),id:crypto.randomUUID(),date:Date.now(),vehicle:vehicleId,route:routeKey()};
   events.emit(completed ? 'route:complete' : 'game:over', result);
   const best = Math.max(+store.get('poda-best-score') || 0, result.score);
   store.set('poda-best-score', String(best));
-  $('overTitle').innerHTML = completed ? 'Shift<br>complete!' : pick(DATA.over).replace(' don ', '<br>don ');
-  $('overEyebrow').textContent = completed ? CONFIG.routes[routeId].name : 'Jammed near ' + stopName(S.stopIdx);
+  $('overTitle').textContent = completed ? 'Route complete!' : 'Di poda don jam!';
+  $('overEyebrow').textContent = completed ? routeName(routeKey()) : 'Jammed near ' + stopName(S.stopIdx);
   $('overLine').textContent = `Delivered ${result.passengersDelivered} passenger${result.passengersDelivered === 1 ? '' : 's'} across ${(result.distance / 1000).toFixed(2)} km. ${result.stopsServed} stops served · ${result.stopsMissed} missed.`;
   $('sScore').textContent = result.score.toLocaleString('en-US');
   $('sCash').textContent = fmtLe(result.earnings);
@@ -1262,25 +1732,67 @@ function endRun(completed = false) {
   $('sStops').textContent = result.stopsServed;
   $('sMissed').textContent = result.stopsMissed;
   $('sPerfect').textContent = result.perfectStops;
-  $('scoreBreakdown').textContent = `Score: ${result.passengersDelivered} delivered × 100 + ${result.stopsServed} stops × 30 + ${result.perfectStops} perfect × 40 + ${Math.floor(result.distance / 20)} distance${completed ? ' + 300 finish' : ''} − ${result.stopsMissed} missed × 25 − ${result.collisions} collisions × 40 (minimum 0).`;
+  $('scoreBreakdown').textContent = `Score: ${result.passengersDelivered} delivered × 100 + ${result.stopsServed} stops × 30 + ${result.perfectStops} perfect × 40 + ${Math.floor(result.distance / 20)} distance + ${result.style} style${completed ? ' + 300 finish' : ''} − ${result.stopsMissed} missed × 25 − ${result.collisions} collisions × 40 (minimum 0).`;
   $('missionSummary').textContent = 'Route goals: ' + missions.status().map(mission => `${mission.label} ${mission.progress}/${mission.target}`).join(' · ');
-  $('onlineStatus').textContent = 'This-device leaderboard · enter a name to save your run.';
+  nameIdentity=undefined;
+  syncResultName();
+  const saved = saveLocalScore();
+  $('onlineStatus').textContent = saved ? 'Saved on this device. You can change your name and save again.' : 'You can download a picture of this run even when browser storage is unavailable.';
   const finishedSerial = runSerial;
+  const finishedHandle = onlineRun;
+  $('cloudRunStatus').textContent = finishedHandle ? 'Saving to your driver account…' : 'Saved on this device. Sign in before a run to join global rankings.';
+  if (api.account?.player && !finishedHandle) $('cloudRunStatus').textContent = 'This run stays on this device. Central and practice runs do not enter global rankings.';
+  accountUI?.render();
+  api.finish(finishedHandle, result, Math.round(S.time * 1000)).then(async receipt => {
+    if (receipt.status === 'accepted') await accountUI?.refresh();
+    if (runSerial !== finishedSerial) return;
+    const messages = { accepted: 'Saved to your account · Le ' + (receipt.earnings || 0) + ' in lifetime fares.',
+      pending: 'Saved on this device. Cloud save is pending; reconnect or open your profile to retry.',
+      rejected: 'Saved on this device only. ' + (receipt.message || ''),
+      local: 'Saved on this device only. Play signed in and online on an eligible route to join global rankings.' };
+    $('cloudRunStatus').textContent = messages[receipt.status];
+    if (receipt.status === 'accepted') {
+      const [allTime, today] = await Promise.allSettled([api.leaderboard('all'), api.leaderboard('today')]);
+      if (runSerial !== finishedSerial) return;
+      if (allTime.status === 'fulfilled' && allTime.value.me) $('cloudRunStatus').textContent += ` All-time position: #${allTime.value.me.rank}.`;
+      const daily = today.status === 'fulfilled' ? today.value.me : null;
+      // A leaderboard position is shown on this card only when the verified daily best matches this run.
+      if (daily?.value === result.score && Number.isInteger(daily.rank) && daily.rank > 0) verifiedScoreRank=daily.rank;
+    }
+  }).catch(() => { if (runSerial === finishedSerial) $('cloudRunStatus').textContent = 'Cloud save unavailable. Your device result is kept.'; });
   $('bestOver').textContent = 'Best score: ' + best.toLocaleString('en-US');
   setHint('');
   setTimeout(() => {
     if (runSerial !== finishedSerial || (state !== 'over' && state !== 'complete')) return;
-    $('over').hidden = false; $('touch').hidden = true;
+    $('over').hidden = false; $('over').scrollTop=0; $('againBtn').focus({preventScroll:true});
+    streakUI?.flush();
   }, 900);
 }
+function returnHome() {
+  queueMicrotask(() => streakUI?.flush());
+  if (!isFinished()) return;
+  pauseRunAudio();
+  runSerial++;
+  changeState('attract');
+  inputManager.release();
+  resetRun();
+  for(const ch of chunks) fillChunk(ch);
+  for(const id of ['over','pause','hud','touch','radio','playerGarage','leaderboard','missionsPanel']) $(id).hidden=true;
+  $('radio').inert=false;
+  if(workshop)workshop.visible=false;
+  world.visible=true; transitionTime=0;
+  setHint(''); popsEl.replaceChildren();
+  $('title').hidden=false; showBest(); $('startBtn').focus();
+}
 function isFinished() { return state === 'over' || state === 'complete'; }
-function showBest() { const b = +store.get('poda-best-score') || 0; $('bestTitle').textContent = b ? 'Best score: ' + b.toLocaleString('en-US') : ''; }
+function showBest() { const b = +store.get('poda-best-score') || 0; $('bestTitle').textContent = b ? b.toLocaleString('en-US') : '—'; }
 function buildPlayer() {
   if (player) {
     scene.remove(player);
+    player.userData.vehicleLights?.dispose();
     player.traverse(part => { if (part.userData.baked) part.geometry.dispose(); });
   }
-  player = vehicleId==='poda' ? makePoda(selectedSlogan, (store.get('poda-board')&&store.get('poda-board')!=='auto'?store.get('poda-board'):DATA.route[0].toUpperCase()+' – '+DATA.route.at(-1).toUpperCase()), SCHEMES[0], true, selectedLivery) : ({kekeh:makeKekeh,taxi:makeCar,okada:makeOkada,waka:makeWakaFine}[vehicleId]()).g;
+  player = vehicleId==='poda' ? makePoda(selectedSlogan, (store.get('poda-board')&&store.get('poda-board')!=='auto'?store.get('poda-board'):DATA.route[0].toUpperCase()+' – '+DATA.route.at(-1).toUpperCase()), SCHEMES[0], true, selectedLivery) : ({kekeh:makeKekeh,taxi:makeCar,okada:() => makeOkada({ player: true }),waka:makeWakaFine}[vehicleId]()).g;
   if(vehicleId==='poda' && ['salone','tektem'].includes(store.get('poda-sticker'))){
     const style=store.get('poda-sticker'),key='sticker:'+style;
     if(!mats[key]){const tex=canvasTex(256,96,(g,w,h)=>{g.fillStyle='#f8efd9';g.fillRect(0,0,w,h);if(style==='salone'){['#1eb53a','#fff','#0072c6'].forEach((c,i)=>{g.fillStyle=c;g.fillRect(0,i*h/3,w,h/3);});}else{g.fillStyle='#254b37';g.font='bold 38px sans-serif';g.fillText('TEK TEM!',20,62);}});mats[key]=new THREE.MeshLambertMaterial({map:tex});}
@@ -1289,13 +1801,20 @@ function buildPlayer() {
   apprentice = player.userData.apprentice;
   const parent = apprentice?.parent;
   if (apprentice) parent.remove(apprentice);
+  const bikePassenger = player.userData.passenger;
+  if (bikePassenger) player.remove(bikePassenger);
   bake(player, true);
   player.traverse(m=>{if(m.isMesh&&m.userData.baked){
     const old=m.material,key='hero:'+old.uuid;
     if(!mats[key])mats[key]=new THREE.MeshStandardMaterial({map:old.map,color:old.color,vertexColors:old.vertexColors,roughness:.78,metalness:.12});
     m.material=mats[key];m.receiveShadow=true;
   }});
+  if (bikePassenger) {
+    player.add(bikePassenger);
+    bikePassenger.visible = (S.pax?.length || 0) > 0;
+  }
   if (apprentice) parent.add(apprentice);
+  attachVehicleLights(player, vehicleId, { player: true });
   scene.add(player);
   if(contactShadow)contactShadow.scale.set(CONFIG.vehicles[vehicleId].width/2.1,CONFIG.vehicles[vehicleId].length/5.4,1);
 }
@@ -1314,7 +1833,8 @@ function openPlayerGarage() {
   if (!player || (state !== 'attract' && !isFinished())) return;
   garageReturnState = state;
   changeState('garage');
-  freeTown();
+  // The aerial is kept, not freed: the garage renders the workshop scene instead,
+  // and closing it returns to the title without rebuilding the map.
   if (!workshop) { workshop=createWorkshop(kit,streetAssets,bake); scene.add(workshop); }
   workshop.visible=true; world.visible=false;
   $('hud').hidden=true; $('radio').hidden=true;
@@ -1334,34 +1854,129 @@ function closePlayerGarage() {
   if (state === 'attract') $('title').hidden = false;
   else $('over').hidden = false;
 }
-function showLeaderboard() { $('leaderboard').hidden = false; loadLeaderboard(); }
+function showLeaderboard() { leaderModal.open(); loadLeaderboard(); }
 function readScores(){try{const rows=JSON.parse(store.get('poda-scores-v2')||'[]');return Array.isArray(rows)?rows.filter(r=>Number.isFinite(r.score)&&Number.isFinite(r.date)):[];}catch{return [];}}
 function saveLocalScore(){
  if(!lastResult)return;
- const name=$('driverName').value.trim().slice(0,24)||'Salone driver';store.set('poda-driver-name',name);
- const rows=readScores().filter(r=>r.id!==lastResult.id);rows.push({...lastResult,name});rows.sort((a,b)=>b.score-a.score);const saved=store.set('poda-scores-v2',JSON.stringify(rows.slice(0,100)));
- $('shareStatus').textContent=saved?'Score saved on this device.':'Browser storage is unavailable. You can still download your poster.';
+ const name=guestProfile.name(api.account?.player);
+ const rows=readScores().filter(r=>r.id!==lastResult.id);rows.push({...lastResult,name});rows.sort((a,b)=>b.score-a.score);
+ return store.set('poda-scores-v2',JSON.stringify(rows.slice(0,100)));
 }
-$('driverName').value=store.get('poda-driver-name')||'';
-$('saveScore').addEventListener('click',saveLocalScore);
+let nameIdentity;
+function syncResultName() {
+ const player=api.account?.player;
+ const identity=player ? `${player.id}:${player.driver_name}` : 'guest';
+ if(identity!==nameIdentity) {
+   $('driverName').value=player ? guestProfile.name(player) : guestProfile.profile.displayName;
+   nameIdentity=identity;
+ }
+ $('guestNameForm').hidden=!!player;
+ $('editAccountName').hidden=!player;
+ $('nicknameHint').textContent=player ? `Scorecard name: ${guestProfile.name(player)}` : 'No account needed. Leave blank to use Guest Driver.';
+}
+function saveNickname(explicit=false) {
+ if(api.account?.player)return true;
+ const name=normalizeNickname($('driverName').value);
+ if(!name && !explicit)return true;
+ try {
+   const persisted=guestProfile.save(name);$('driverName').value=name;
+   $('nicknameStatus').textContent=persisted?'Nickname saved. You can edit it anytime.':'Nickname saved for this session. Browser storage is unavailable.';
+   saveLocalScore();return true;
+ } catch(error) { $('nicknameStatus').textContent=error.message;$('driverName').focus();return false; }
+}
+function scorecardName() {
+ return api.account?.player ? guestProfile.name(api.account.player) : normalizeNickname($('driverName').value)||'Guest Driver';
+}
+syncResultName();
+$('driverName').addEventListener('input',()=>{ $('driverName').value=normalizeNicknameInput($('driverName').value);$('nicknameStatus').textContent=''; });
+// Preserve spaces while typing; trim only on save/export.
+function normalizeNicknameInput(value) { return Array.from(value).slice(0,24).join(''); }
+$('guestNameForm').addEventListener('submit',event=>{event.preventDefault();saveNickname(true);});
+$('editAccountName').addEventListener('click',()=>accountUI?.open());
 $('copyLink').addEventListener('click',async()=>{try{await navigator.clipboard.writeText(gameURL);$('shareStatus').textContent='Game link copied.';}catch{$('shareStatus').textContent=gameURL;}});
-$('shareScore').addEventListener('click',()=>exportPoster(true));
+const scorePreview=modal($('scorePreview'));
+let posterCache=null, posterBusy=false;
+async function preparePoster() {
+ saveNickname();
+ const name=scorecardName(), rank=verifiedScoreRank, key=JSON.stringify([lastResult.id,name,rank]);
+ if(posterCache?.key===key)return posterCache;
+ const blob=await createScorePoster({name,score:lastResult.score,rank});
+ if(posterCache)URL.revokeObjectURL(posterCache.url);
+ posterCache={key,blob,url:URL.createObjectURL(blob),score:lastResult.score};
+ return posterCache;
+}
+async function previewPoster() {
+ if(!lastResult||posterBusy)return;
+ posterBusy=true;$('shareStatus').textContent='Creating your 4K scorecard…';
+ try {
+   const poster=await preparePoster();$('scorePreviewImage').src=poster.url;
+   $('scorePreviewImage').alt=`${scorecardName()} — ${poster.score.toLocaleString('en-US')} points in Poda-Poda Run`;
+   $('previewStatus').textContent='';
+   scorePreview.open();$('shareStatus').textContent='';
+ } catch(error) { $('shareStatus').textContent='Could not create the scorecard. Please try again.';console.error(error); }
+ finally {posterBusy=false;}
+}
+$('previewPoster').addEventListener('click',previewPoster);
+$('shareScore').addEventListener('click',previewPoster);
+$('closePreview').addEventListener('click',()=>scorePreview.close());
+$('sharePoster').addEventListener('click',()=>exportPoster(true));
 $('downloadPoster').addEventListener('click',()=>exportPoster(false));
 async function exportPoster(allowNativeShare){
- if(!lastResult)return;saveLocalScore();$('shareScore').disabled=true;$('shareStatus').textContent='Creating your 4K poster…';
- try{
- const blob=await createScorePoster({THREE,renderer,player:resultModel,name:$('driverName').value,score:lastResult.score,vehicle:resultVehicle,route:resultRoute,url:gameURL});
- const file=new File([blob],'poda-poda-score.png',{type:'image/png'});
- if(allowNativeShare && navigator.canShare?.({files:[file]})){$('shareScore').disabled=false;$('shareStatus').textContent='Choose an app in the share dialog, or use Download PNG.';try{await navigator.share({files:[file],title:'Poda-Poda Run',text:'Can you beat my Freetown score?'});$('shareStatus').textContent='Poster shared.';return;}catch(error){if(error.name==='AbortError'){$('shareStatus').textContent='Sharing cancelled. Your score is saved.';return;}}}
- const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=file.name;a.click();setTimeout(()=>URL.revokeObjectURL(url),30000);$('shareStatus').textContent='4K PNG downloaded. Share it with your crew!';
- }catch(error){$('shareStatus').textContent='Could not create the poster. Please try again.';console.error(error);}finally{$('shareScore').disabled=false;}
+ if(!posterCache||posterBusy)return;
+ const poster=posterCache, file=new File([poster.blob],'poda-poda-score.png',{type:'image/png'});
+ posterBusy=true;
+ try {
+   if(allowNativeShare && navigator.canShare?.({files:[file]})) {
+     await navigator.share({files:[file],title:'Poda-Poda Run',text:`I scored ${poster.score.toLocaleString('en-US')} in Poda-Poda Run. Can you beat me? ${gameURL}`});
+     $('previewStatus').textContent='Scorecard shared.';return;
+   }
+   const a=document.createElement('a');a.href=poster.url;a.download=file.name;a.click();
+   $('previewStatus').textContent='PNG saved. Share it with your crew!';
+ } catch(error) { $('previewStatus').textContent=error.name==='AbortError'?'Sharing cancelled. You can still save your PNG.':'Sharing unavailable. Use Save PNG instead.'; }
+ finally {posterBusy=false;}
+}
+let leaderboardRequest = 0;
+function leaderRow(rank, name, score, isMe = false, detail = '') {
+ const li = document.createElement('li');
+ const medal = document.createElement('span'); medal.className = 'leader-medal'; medal.textContent = rank;
+ const driver = document.createElement('span'); driver.className = 'leader-driver'; driver.textContent = name;
+ const value = document.createElement('strong'); value.className = 'leader-score'; value.textContent = score;
+ li.append(medal, driver);
+ if (isMe) { li.classList.add('is-me'); const you = document.createElement('span'); you.className = 'leader-you'; you.textContent = 'you'; li.append(you); }
+ if (detail) { const note = document.createElement('small'); note.textContent = detail; driver.append(note); }
+ li.append(value); return li;
 }
 async function loadLeaderboard() {
- const period=$('leaderPeriod').value,now=new Date(),start=new Date(now);start.setHours(0,0,0,0);if(period==='week')start.setDate(start.getDate()-(start.getDay()+6)%7);
- const entries=readScores().filter(r=>period==='all'||r.date>=start.getTime()).sort((a,b)=>b.score-a.score);
- $('leaderEntries').replaceChildren();$('leaderMessage').textContent='This device · '+(entries.length?'Best driving scores':'No saved scores yet.');
- for(const entry of entries){const li=document.createElement('li');li.textContent=`${entry.name} — ${entry.score.toLocaleString('en-US')} · ${CONFIG.routes[entry.route]?.name||'Run'} · ${CONFIG.vehicles[entry.vehicle]?.name||'Poda'}`;$('leaderEntries').append(li);}
+ const serial = ++leaderboardRequest, period=$('leaderPeriod').value;
+ $('leaderEntries').replaceChildren(); $('leaderMe').textContent='';
+ $('leaderIdentity').textContent = 'Playing as ' + guestProfile.name(api.account?.player);
+ $('leaderCount').textContent = 'Drivers';
+ if ($('leaderScope').value === 'local') {
+   const now = new Date(), start = new Date(now); start.setUTCHours(0,0,0,0);
+   if (period === 'week') start.setUTCDate(start.getUTCDate() - (start.getUTCDay()+6)%7);
+   const entries = readScores().filter(r => period === 'all' || r.date >= start.getTime()).sort((a,b)=>b.score-a.score);
+   $('leaderMessage').textContent = period === 'earners' ? 'Earners are ranked globally by verified lifetime fares.' : entries.length ? '' : 'No saved scores yet.';
+   if (period === 'earners') return;
+   $('leaderCount').textContent = `${entries.length} ${entries.length === 1 ? 'run' : 'runs'}`;
+   entries.forEach((entry, index) => $('leaderEntries').append(leaderRow(index + 1, entry.name, entry.score.toLocaleString('en-US'), false, `${routeName(entry.route)||'Run'} · ${CONFIG.vehicles[entry.vehicle]?.name||'Poda'}`)));
+   return;
+ }
+ $('leaderMessage').textContent='Loading global drivers…';
+ try {
+   const board=await api.leaderboard(period); if (serial !== leaderboardRequest) return;
+   $('leaderMessage').textContent=board.entries.length ? '' : 'No accepted runs yet. Be the first driver on this board.';
+   $('leaderCount').textContent=`${board.entries.length}${board.entries.length === 50 ? '+' : ''} ${board.entries.length === 1 ? 'driver' : 'drivers'}`;
+   for (const entry of board.entries) {
+     $('leaderEntries').append(leaderRow(entry.rank, entry.name, (period==='earners'?'Le ':'')+entry.value.toLocaleString('en-US'), entry.playerId === board.me?.playerId));
+   }
+   if (board.me && !board.entries.some(entry => entry.playerId === board.me.playerId)) {
+     $('leaderMe').textContent = 'Your position';
+     $('leaderEntries').append(leaderRow(board.me.rank, board.me.name, (period==='earners'?'Le ':'')+board.me.value.toLocaleString('en-US'), true));
+   } else if (!board.me) $('leaderMe').textContent=api.account?.player ? 'You have no accepted run in this period yet.' : 'Sign in to earn an official position.';
+ } catch (error) { if (serial === leaderboardRequest) $('leaderMessage').textContent=error.message+' You can view This device above.'; }
 }
+$('leaderScope').addEventListener('change',loadLeaderboard);
+$('leaderRefresh').addEventListener('click',loadLeaderboard);
 
 /* ---------- Autopilot (title-screen attract mode and #demo) ---------- */
 function autopilot() {
@@ -1423,14 +2038,35 @@ function loop(now) {
     }else update(dt);
   }
   if(state==='garage') poseGarageCamera();
+  const preset = environment.current;
+  const lightingDt = state === 'paused' ? 0 : dt;
+  const playerBrake = input.brake || input.brakePulse > 0 || S.dwell > 0;
+  player?.userData.vehicleLights?.update(preset, playerBrake, qualityManager.profile, 0, lightingDt, S.speed);
+  let npcBeams = 0;
+  for (const o of obstacles) {
+    const lights = o.g.userData.vehicleLights, distance = Math.abs(o.z);
+    const projected = npcBeams < 2 && distance < NPC_BEAM_DISTANCE;
+    lights?.update(preset, !!o.braking, qualityManager.profile, distance, lightingDt, o.speed, projected);
+    if (lights?.plane.visible) npcBeams++;
+    if (o.g.userData.nightRim) { o.g.userData.nightRim.visible = preset.backdrop > .001; o.g.userData.nightRim.material.opacity = .45*preset.backdrop; }
+  }
+  environment.positionLight();
   musicTick(dt);
   engineTick();
   for(const ch of chunks){
-    ch.visible=ch.position.z > -qualityManager.budget.distance;
+    ch.visible=!cbd && ch.position.z > -qualityManager.budget.distance;
     const nearby=ch.position.z > -qualityManager.budget.shadowDistance;
     for(const mesh of ch.userData.content.children)if(mesh.isMesh)mesh.castShadow=nearby;
   }
-  renderer.render(scene, camera);
+  // The title shows the peninsula from above; every other state shows the street.
+  if (cbd) cbd.setVisible(state !== 'garage');
+  if (state === 'attract' && aerial) renderTown();
+  else if (cbd && state !== 'garage') {
+    if (cbdView) { cbd.poseView(camera, cbdView); player.visible = contactShadow.visible = world.visible = false; }
+    else cbd.beforeRender({ camera, sun, player, extras: trafficDebug ? [contactShadow,...trafficDebug.objects] : [contactShadow], lightOffset: environment.current.sunOffset, coins: { mesh: coinIM, list: coins }, drawDistance: qualityManager.budget.distance });
+    renderer.render(scene, camera);
+    if (!cbdView) cbd.afterRender({ camera, sun });
+  } else renderer.render(scene, camera);
   sampleMetrics(raw);
   if (hud3d && (state === 'play' || demo)) {
     try { hud3d.render(renderer); }
@@ -1444,12 +2080,26 @@ function update(dt) {
   if (auto && !isFinished()) autopilot();
   if (state === 'attract') S.hitAt = -99;
 
+  if (cbd) S.speedCap = cbd.speedCap();
   const { distance: d, gas, dwellFinished } = window.PODA_PlayerSystem.stepPlayer(S, input, dt, state, LANES);
+  if (cbd) cbd.advance(d);
   if (dwellFinished) finishDwell();
+
+  // Style multiplier: holding speed between stops pays, loading and knocks reset it.
+  if (state === 'play') {
+    if (S.dwell > 0 || S.reversing) S.fastTime = 0;
+    else if (RULES.isFast(S.speed, S.vehicle && S.vehicle.maxSpeed)) S.fastTime += dt;
+    else S.fastTime = Math.max(0, S.fastTime - dt * 2);
+    const multiplier = RULES.speedMultiplier(S.fastTime);
+    if (multiplier > S.multiplier) pop('Fast ×' + multiplier);
+    S.multiplier = multiplier;
+    S.style += RULES.stylePoints(multiplier, Math.max(0, d));
+  }
 
   if(window.PODA_JumpSystem.step(S,dt)){S.bump=.22;S.shake=reduceMotion?0:.15;sfx('thud');events.emit('jump:land',{});}
   S.bump=Math.max(0,S.bump-dt);
   // player
+  if (trafficDebug && S.vehicle) trafficDebug.update(dt);
   player.position.x = S.x;
   player.rotation.y = -(LANES[S.lane] - S.x) * 0.07;
   player.rotation.z = (LANES[S.lane] - S.x) * 0.025 + (S.speed > 1 ? Math.sin(S.time * 18) * 0.004 : 0);
@@ -1471,36 +2121,53 @@ function update(dt) {
     ch.position.z += d;
     if (ch.position.z - CH > 22) { ch.position.z -= NCH * CH; fillChunk(ch); }
   }
+  const previousPlayerX = S.x;
 
   // bus stops
   if (!stopObj && !isFinished() && S.toStop <= 205) spawnStop();
+  if (!stopObj) S.reversing = false;
   if (stopObj) {
     const s = stopObj; s.z += d; s.g.position.z = s.z;
     if (!s.served && !s.missed && !isFinished()) {
       const inZone = RULES.canServeStop({ distanceFromCentre: s.z, lane: S.lane, laneX: LANES[2], playerX: S.x, speed: S.speed });
-      if (inZone && !S.jumpY) beginDwell();
-      else if (s.z > 9) missStop();
-    }
+      if (inZone && !S.jumpY) { S.reversing = false; beginDwell(); }
+      else if (RULES.stopMissed({ distanceFromCentre: s.z })) { S.reversing = false; missStop(); }
+      else {
+        // Overshot but still winnable: hold the brake in the kerb lane to back up.
+        const recovering = RULES.canRecoverStop({
+          distanceFromCentre: s.z, lane: S.lane, braking: input.brake || input.brakePulse > 0,
+        });
+        if (recovering && !S.reversing) { say('reverse'); sfx('thud'); }
+        S.reversing = recovering;
+      }
+    } else S.reversing = false;
     for (const w of s.walkers) {
       if ((w.delay -= dt) > 0) continue;
       const to = w.to, p = w.p.position, dx = to.x - p.x, dz = to.z - p.z, len = Math.hypot(dx, dz);
-      if (len < 0.15) { if (w.vanish) w.p.visible = false; continue; }
+      if (len < 0.15) {
+        if (w.vanish) {
+          w.p.visible = false;
+          if (vehicleId === 'okada' && S.dwell > 0 && player.userData.passenger) player.userData.passenger.visible = true;
+        }
+        continue;
+      }
       const st = Math.min(len, 3.2 * dt); p.x += dx / len * st; p.z += dz / len * st; w.p.rotation.y = Math.atan2(dx, dz);
       if (PLUG.people && PLUG.people.walk) PLUG.people.walk(w.p, S.time * 1.6);
     }
-    if (s.z > 45) { drop(s.g); stopObj = null; }
+    // Keep the stop in the world for the whole recovery stretch, or it would vanish
+    // from under a player who is still backing up to it.
+    if (s.z > RULES.RECOVER_LIMIT + 15) { drop(s.g); stopObj = null; }
   }
 
   // hints
   if (state === 'play' && !demo) {
     const s = stopObj && !stopObj.served && !stopObj.missed ? stopObj : null;
-    if (S.dwell > 0) setHint('Loading passengers…');
-    else if (s && s.z > -110 && s.z < 8) {
-      const metres = Math.max(0, Math.round(-s.z));
-      setHint(S.lane !== 2 ? `STOP IN ${metres} m · KEEP RIGHT <kbd>→</kbd>` :
-        metres > 25 ? `STOP IN ${metres} m · SLOW DOWN <kbd>↓</kbd>` : 'BRAKE IN THE YELLOW BOX <kbd>↓</kbd>');
-    }
-    else setHint('');
+    const cue = (s || S.dwell > 0) ? RULES.stopGuidance({
+      distanceFromCentre: s ? s.z : 0,
+      lane: S.lane, dwelling: S.dwell > 0, recovering: S.reversing,
+    }) : null;
+    const metres = s ? Math.max(0, Math.round(Math.abs(s.z))) : 0;
+    setHint(STOP_CUES[cue] ? STOP_CUES[cue](metres) : cbd ? cbd.turnHint() : '');
   }
 
   // spawn
@@ -1511,20 +2178,32 @@ function update(dt) {
     S.nextRow = rand(30, 42) - 12 * prog;
   }
 
-  // obstacles
-  for (let i = obstacles.length - 1; i >= 0; i--) {
-    const o = obstacles[i];
-    window.PODA_TrafficAI.step(o,obstacles,S,dt,LANES);
+  // Front-to-back update gives each follower its leader's current position.
+  // Collision checks run after movement, so array order cannot change contact.
+  const trafficOrder = obstacles.slice().sort((a,b)=>a.z-b.z);
+  const previousPositions = new Map();
+  for (const o of trafficOrder) {
+    previousPositions.set(o,{x:o.x,z:o.z});
+    if (o.poolKey === 'sendme') window.PODA_SendMe.step(o, obstacles, S, dt, cbd ? cbd.route.speedCap(cbd.s-o.z) : Infinity, LANES);
+    else window.PODA_TrafficAI.step(o,obstacles,S,dt,LANES,Math.random,d);
     const despawn = window.PODA_TrafficSystem.stepTraffic(o, d, dt, LANES);
+    if (o.poolKey === 'sendme') {
+      const k = cbd ? cbd.route.path.frameAt(cbd.s-o.z, sendMeFrame).k : 0;
+      animateSendMe(o, o.speed*dt*(1+k*o.x), dt, k);
+    }
     if (o.cross) {
       if (o.body) o.body.position.y = Math.abs(Math.sin(S.time * 10)) * 0.06;
       o.g.rotation.y = heading(o);
       if (o.person && PLUG.people && PLUG.people.walk) PLUG.people.walk(o.g, S.time * (o.flee ? 2.2 : 1));
     }
     o.g.position.set(o.x, 0, o.z);
-    if (despawn) { releaseObstacle(o); obstacles.splice(i, 1); continue; }
-    if (!isFinished() && window.PODA_CollisionSystem.overlapsPlayer(S, o)) {
-      if (state === 'attract' && !demo) { /* attract mode never crashes */ drop(o.g); obstacles.splice(i, 1); continue; }
+    if (despawn) { releaseObstacle(o); obstacles.splice(obstacles.indexOf(o), 1); continue; }
+  }
+  for (const o of trafficOrder) {
+    if (!obstacles.includes(o)) continue;
+    const previous = previousPositions.get(o);
+    if (!isFinished() && window.PODA_CollisionSystem.sweepsPlayer(S, o, previousPlayerX, previous.x, previous.z)) {
+      if (state === 'attract' && !demo) { /* attract mode never crashes */ drop(o.g); obstacles.splice(obstacles.indexOf(o), 1); continue; }
       hit(o);
     }
   }
@@ -1571,25 +2250,31 @@ function update(dt) {
 
 function setupBenchmark() {
   changeState('play');
+  environment.setState(store.get('poda-environment') === 'NIGHT' ? 'NIGHT' : 'DAY');
   for(const o of obstacles)releaseObstacle(o);obstacles=[];
   for(const c of coins)coinFree(c);coins=[];
   coinIM.instanceMatrix.needsUpdate=true;
   S.x=0;S.lane=1;S.speed=13.3;S.toStop=420;S.legLen=600;
   player.position.set(0,0,0);player.rotation.set(0,0,0);
   contactShadow.position.x=0;
-  const fixtures=[[makeWakaFine,-3.4,-23],[makeKekeh,3.4,-18],[makeKekeh,-3.4,-45],[makeCar,0,-38],[()=>freight.make({type:'flatbed'}),3.4,-57]];
-  for(const [factory,x,z] of fixtures){const o=pooled('benchmark'+x+z,factory);o.g.position.set(x,0,z);world.add(o.g);obstacles.push(o);}
-  for(let i=0;i<5;i++){const o=pooled('pothole'+i,()=>streetAssets.pothole(i));o.g.position.set(i%2?-2.2:2.3,0,-9-i*10);world.add(o.g);obstacles.push(o);}
+  const fixtures=[[makeWakaFine,-3.4,-23,'waka'],[makeKekeh,3.4,-18,'kekeh'],[makeKekeh,-3.4,-45,'kekeh'],[makeCar,0,-38,'taxi'],[()=>freight.make({type:'flatbed'}),3.4,-57,'freight']];
+  for(const [factory,x,z,kind] of fixtures){const o=pooled('benchmark'+x+z,factory);attachVehicleLights(o.g,kind,{length:o.len});o.x=x;o.z=z;o.g.position.set(x,0,z);world.add(o.g);obstacles.push(o);}
+  for(let i=0;i<5;i++){const o=pooled('pothole'+i,()=>streetAssets.pothole(i));o.x=i%2?-2.2:2.3;o.z=-9-i*10;o.g.position.set(o.x,0,o.z);world.add(o.g);obstacles.push(o);}
   camera.position.set(2,4.5,13.5);camera.lookAt(0,1.5,-16);cameraSystem.lookX=0;
   sun.position.set(-28,32,20);sun.target.position.set(0,0,-12);
   $('title').hidden=true;$('hud').hidden=false;$('touch').hidden=false;$('radio').hidden=false;
   updateHud();
 }
 let metricSeconds=0,metricFrames=0;
+const metricMaterials = new Set();
 function sampleMetrics(raw) {
   metricSeconds+=raw;metricFrames++;
   if(metricSeconds>=1){
-    const m={fps:Math.round(metricFrames/metricSeconds),calls:renderer.info.render.calls,triangles:renderer.info.render.triangles,geometries:renderer.info.memory.geometries,textures:renderer.info.memory.textures,ratio:qualityManager.ratio};
+    let objects=0, visibleObjects=0, dynamicLights=0, shadowLights=0;
+    metricMaterials.clear();
+    scene.traverse(o => { objects++; if(o.material) { if(Array.isArray(o.material)) o.material.forEach(m=>metricMaterials.add(m)); else metricMaterials.add(o.material); } });
+    scene.traverseVisible(o => { visibleObjects++; if (o.isLight && o.intensity > 0) { dynamicLights++; if (o.castShadow) shadowLights++; } });
+    const m={fps:Math.round(metricFrames/metricSeconds),frameMs:1000*metricSeconds/metricFrames,calls:renderer.info.render.calls,triangles:renderer.info.render.triangles,geometries:renderer.info.memory.geometries,textures:renderer.info.memory.textures,ratio:qualityManager.ratio,objects,visibleObjects,materials:metricMaterials.size,dynamicLights,shadowLights,environment:environment.state};
     PLUG.debug.metrics=m;
     if(params.has('stats')){let el=$('renderStats');if(!el){el=document.createElement('output');el.id='renderStats';document.body.appendChild(el);}el.textContent=`${m.fps} FPS · ${m.calls} draws · ${Math.round(m.triangles/1000)}k triangles · DPR ${m.ratio.toFixed(2)}`;}
     metricSeconds=metricFrames=0;
@@ -1618,52 +2303,27 @@ function garage() {
   (function spin() { renderer.render(scene, camera); requestAnimationFrame(spin); })();
 }
 
-/* ---------- Title backdrop: slow aerial orbit over the downtown Freetown diorama ----------
-   Decoded from town-model.js (gzipped int16 positions + per-triangle palette), one draw call.
-   Freed as soon as a run starts, so it costs nothing during play. */
-const town = { scene: null, cam: new THREE.PerspectiveCamera(42, 1, 1, 900), mesh: null };
-async function loadTown() {
-  if (!window.PODA_TOWN || !window.DecompressionStream || demo || params.has('district') || params.has('garage')) return;
-  const b64 = window.PODA_TOWN, bin = new Uint8Array(b64.length * 3 / 4 | 0);
-  const raw = atob(b64); for (let i = 0; i < raw.length; i++) bin[i] = raw.charCodeAt(i);
-  window.PODA_TOWN = null;
-  const buf = await new Response(new Blob([bin]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer();
-  const hl = new DataView(buf).getUint32(0, true);
-  const head = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 4, hl)));
-  let off = 4 + hl; off += (4 - off % 4) % 4;
-  const n = head.tris * 9, q = new Int16Array(buf, off, n), fc = new Uint8Array(buf, off + n * 2, head.tris);
-  const pos = new Float32Array(n), col = new Float32Array(n);
-  for (let i = 0; i < n; i++) pos[i] = (q[i] + 32767) * head.scale + head.lo[i % 3];
-  for (let t = 0; t < head.tris; t++) { const c = head.palette[fc[t]]; for (let k = 0; k < 9; k += 3) col.set(c, t * 9 + k); }
-  const geo = new THREE.BufferGeometry();
-  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-  geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
-  geo.computeVertexNormals();                                   // flat, low-poly shading
-  for (const k of ['position', 'color', 'normal']) geo.attributes[k].onUpload(function () { this.array = null; }); // drop CPU copies once on the GPU
-  if (state !== 'attract') { geo.dispose(); return; }
-  const sc = new THREE.Scene();
-  sc.background = scene.background;
-  sc.fog = new THREE.Fog(0xcfe3e8, 260, 520);
-  sc.add(new THREE.HemisphereLight(0xf2f8ff, 0x8a5a3a, 0.85));
-  const dl = new THREE.DirectionalLight(0xfff0d2, 0.75); dl.position.set(-60, 120, 70); sc.add(dl);
-  town.mesh = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({ vertexColors: true }));
-  town.mesh.matrixAutoUpdate = false; sc.add(town.mesh);
-  town.scene = sc;
-  resize();
+/* ---------- Title backdrop: a bird's-eye diorama of the Freetown peninsula ----------
+   Generated geometry, not map data: the coastline, the estuary and the
+   mountains are built from a height function at boot. Lives in its own scene
+   and is disposed the moment a run starts, so it costs nothing while driving. */
+let aerial = null;
+function loadTown() {
+  if (demo || params.has('district') || params.has('garage') || benchmark || cbdView) return;
+  aerial = createFreetownAerial(THREE, { canvasTex, fitText });
 }
 function freeTown() {
-  if (!town.mesh) return;
-  town.mesh.geometry.dispose(); town.mesh.material.dispose();
-  town.scene = town.mesh = null;
+  if (!aerial) return;
+  aerial.dispose();
+  aerial = null;
 }
-function renderTown(t) {
-  const a = t * 0.00006 + 0.6, r = 135;
-  town.cam.position.set(Math.sin(a) * r, 52 + Math.sin(t * 0.0002) * 8, Math.cos(a) * r);
-  town.cam.lookAt(0, 4, 0);
-  renderer.render(town.scene, town.cam);
+function renderTown() {
+  aerial.update(performance.now() * 0.001, camera.aspect, reduceMotion);
+  renderer.render(aerial.scene, aerial.camera);
 }
 
 let baseFov = 58;
+const cbdView = CBD_FLAG ? params.get('view') : null;   // ?cbd&view=x,z,yaw,height: fixed comparison camera
 function resize() {
   const w = innerWidth, h = innerHeight;
   renderer.setSize(w, h, false);
@@ -1671,8 +2331,19 @@ function resize() {
   baseFov = w / h < 0.8 ? 68 : 58;
   camera.fov = baseFov;
   camera.updateProjectionMatrix();
-  town.cam.aspect = w / h; town.cam.fov = w / h < 0.8 ? 62 : 42; town.cam.updateProjectionMatrix();
+  // The aerial sets its own aspect and field of view each frame in update().
   if (hud3d) hud3d.resize(w, h);
+}
+function setupCbdLighting(mode) {
+  environment.addRoad(mode.materials.road);
+  environment.addWindows(mode.materials.win);
+  environment.addWindows(mode.materials.shop);
+  environment.addBuildings(mode.materials.vc);
+  environment.addBackdrop(mode.panorama.material, 0xffffff, 0x3f4a62);
+  streetLighting = createStreetLights(mode.lampPositions);
+  mode.group.add(streetLighting.group);
+  const lighting = streetLighting;
+  environment.subscribe(p => lighting.set(p.streetlights));
 }
 addEventListener('resize', resize);
 
@@ -1695,9 +2366,42 @@ fontsReady.catch(() => {}).then(() => {
   registerEasternDistricts(PLUG);
   freight = createFreightFactory(kit, streetAssets);
   lumleyDetails = createLumleyDetails(kit, streetAssets, createBuildingFactory(kit, streetAssets));
-  PLUG.kit = kit; PLUG.debug = { renderer, scene };
+  PLUG.kit = kit; PLUG.debug = { renderer, scene, run: () => ({ S, obstacles, input, state }) };   // read-only hooks for scripts/ tooling
+  if (params.has('stats')) PLUG.debug.spawnSendMe = (lane=0,z=-35) => {
+    if (!window.PODA_SendMe.config.enabled || !Number.isInteger(lane) || lane<0 || lane>2 || z>20 || z< -240 || Math.abs(z)<10 || obstacles.some(o=>Math.abs(o.z-z)<22 && Math.abs(o.x-LANES[lane])<3)) return null;
+    const o=pooled('sendme',makeSendMe); Object.assign(o,{lane,x:LANES[lane],z,speed:LANE_SPEED[lane],cruise:LANE_SPEED[lane],weave:false});
+    o.g.position.set(o.x,0,z); world.add(o.g); obstacles.push(o); return o;
+  };
   initCoins();
   buildStatic();
+  const centralHelp = document.createElement('p');
+  centralHelp.textContent = 'Freetown Central follows mapped streets from Congo Cross through Cotton Tree, PZ and Sani Abacha Street to Eastern Police. Bends turn automatically; steer between lanes and brake for stops. Scores stay on this device.';
+  $('titleHelp').insertBefore(centralHelp, $('titleHelpClose'));
+  // Keep map attribution available in menus without overlaying the road or HUD.
+  for (const menu of [$('titleHelp'), document.querySelector('.pause-options')]) {
+    const credit = document.createElement('p');
+    credit.className = 'cbd-map-credit';
+    credit.append('Map data © ', Object.assign(document.createElement('a'), {
+      href: 'https://www.openstreetmap.org/copyright',
+      textContent: 'OpenStreetMap contributors (ODbL)',
+    }));
+    menu.insertBefore(credit, menu === $('titleHelp') ? $('titleHelpClose') : null);
+  }
+  if (routeId === 'central') {
+    centralMode = cbd = createCbdMode({ THREE, kit, scene, world, bake, textures: { road: roadTex, roadDetail: roadDetailTex, walk: walkTex } });
+    setupCbdLighting(cbd);
+    scene.getObjectByName('street-static').visible = false;
+    DATA.route = routeStops();
+    PLUG.debug.cbd = cbd;
+    selectionDetails();
+    updateTitleRoute();
+  }
+  // Chunk lights are attached individually so they recycle with their scenery.
+  for (const ch of chunks) {
+    const lights = createStreetLights([-1,1].map(side => ({ x:side*(ROAD_HALF+1.2), z:-CH/2 })));
+    ch.add(lights.group);
+    environment.subscribe(p => lights.set(p.streetlights));
+  }
   if (params.has('garage')) return garage();
   for (const [id, label] of LIVERIES) $('garageLivery').add(new Option(label, id));
   for (const slogan of DATA.slogans) $('garageSlogan').add(new Option(slogan, slogan));
@@ -1711,16 +2415,43 @@ fontsReady.catch(() => {}).then(() => {
   });
   contactShadow = new THREE.Mesh(new THREE.PlaneGeometry(3.5, 7.3), new THREE.MeshBasicMaterial({ map: shadowTex, transparent: true, depthWrite: false, opacity: .6 }));
   contactShadow.rotation.x = -Math.PI / 2; contactShadow.position.set(LANES[2], .018, 0); scene.add(contactShadow);
+  environment.subscribe(p => { contactShadow.material.opacity = p.shadowOpacity; });
   resetRun();
   camera.position.set(S.x + 2, 4.5, 13.5);
   cameraSystem.lookX = S.x;
   camera.lookAt(S.x, 1.5, -16);
   showBest();
+  streakUI = createStreakUI({ api, store, gameVersion: RULES.GAME_VERSION, safe: () => state === 'attract' || ((state === 'over' || state === 'complete') && !$('over').hidden) });
+  accountUI = createAccountUI({ api, store, onProfileChange: () => { syncResultName(); streakUI.sync(); }, canApply: () => state === 'attract', applyPreferences: preferences => {
+    if (state !== 'attract') return;
+    const controls = {'poda-vehicle':'rideSelect','poda-route':'routeSelect','poda-livery':'garageLivery',
+      'poda-slogan':'garageSlogan','poda-paint':'bodyPaint','poda-rack':'rackSelect','poda-cargo':'cargoSelect',
+      'poda-wheels':'wheelSelect','poda-trim':'bodyTrim','poda-board':'routeBoard','poda-sticker':'stickerSelect','poda-horn':'hornSelect'};
+    for (const [key, id] of Object.entries(controls)) {
+      const control = $(id), value = preferences[key];
+      if (value && Array.from(control.options).some(option => option.value === value)) { control.value=value; control.dispatchEvent(new Event('change')); }
+    }
+  }});
   const savedQuality = store.get('poda-quality') || 'auto';
   $('qualityProfile').value = savedQuality;
   qualityManager.setProfile(savedQuality);
   resize();
+  // Offline support. Production only: in development it would serve stale
+  // assets back over Vite's hot reload.
+  if (import.meta.env.PROD && 'serviceWorker' in navigator) {
+    navigator.serviceWorker.register('./sw.js').catch(() => {});
+  }
+  loadTown();
   if (demo && !benchmark) startRun();
+  // Development showcase: load `?sendme` to place one rider in live traffic
+  // immediately. Normal gameplay keeps the configured probabilistic spawn.
+  if (params.has('sendme') && !benchmark) {
+    startRun();
+    setTimeout(() => {
+      const rider = PLUG.debug.spawnSendMe?.(0, -24);
+      if (rider) rider.g.userData.showcase = true;
+    }, 350);
+  }
   // The actual player vehicle is the title showcase; no separate town scene is allocated.
   if (benchmark) setupBenchmark();
   requestAnimationFrame(t => { clock.reset(); loop(t); });
